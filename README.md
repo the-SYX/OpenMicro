@@ -1,109 +1,61 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="site/public/assets/wordmark-dark.png">
-  <img src="site/public/assets/wordmark-light.png" alt="openmicrokbd" width="560">
-</picture>
+# OpenMicro — stock Codex Micro support
 
-# OpenMicroKbd
+A fork of [conol-ai/openmicrokbd](https://github.com/conol-ai/openmicrokbd)'s companion app (OpenMicro.app 0.15.0) that drives the **Work Louder Codex Micro on its stock firmware** (tested on 0.1.43) from a Mac, without ChatGPT Desktop and without flashing anything.
 
-An open-source hardware recreation of OpenAI's **Codex Micro** macropad — 13 low-profile keys, a rotary encoder, an analog joystick, a capacitive touch pad, and per-key + underglow RGB on a wired USB-C board built around an STM32F072.
+Upstream expects its own firmware with an on-device keymap. The stock pad has no keymap storage, so this fork runs every binding on the host instead. Everything below is about the changes in this fork; see upstream for the hardware, firmware and original app.
 
-[![The finished OpenMicroKbd held in one hand: black PCB in a white printed case, icon keycaps, a knob, a joystick and a yellow accent key](site/public/blog/openmicrokbd-launch/img/hero.webp)](https://openmicrokbd.org/blog/openmicrokbd-launch/)
+## What's changed
 
-*The finished board — read the [launch post](https://openmicrokbd.org/blog/openmicrokbd-launch/) for the full story.*
+### Stock-firmware backend (`app/src/stock.rs`)
+- Falls back to the stock pad (VID `0x303A`, vendor usage page `0xFF00`, JSON-RPC over report 6) when no OpenMicro firmware is found. Opens non-exclusively.
+- Maps pad events to app slots: keys → 0–12, knob CW/CCW → 13/14, knob press → 15, joystick U/D/L/R → 16–19. The stock firmware's encoder names are reversed; this is corrected.
+- All bindings run on the Mac (keystrokes, media, macros, actions).
+- Lighting via `v.oai.rgbcfg` (backlight + ambient) and `v.oai.thstatus` (the six translucent keys can be coloured individually; the rest share one colour).
+- **Safety:** firmware update, DFU, bootloader and device-mode commands are refused for the stock pad. Only read-only queries and lighting calls are sent.
 
-**The PCB is written, not drawn.** The entire schematic is source code in [**CoHDL**](https://cohdl.org), an open-source, AI-native hardware description language. The compiler type-checks the design — units, pin-connection obligations, power integrity — and emits the netlist, BOM, footprints and layout constraints you can inspect under [`hw/v1/out/`](hw/v1/out/).
+### Profiles
+- **Per-app switching:** link profiles to apps; the active profile follows the front app, with one Default profile as the fallback.
+- **Inherit from Default:** unbound controls fall back to the Default profile's binding; "Do nothing" disables a control explicitly.
+- **Hold layers:** hold a trigger key to give the other controls a second set of bindings; a bare tap still runs the trigger's own binding.
+- **Per-profile lighting** and per-key colours (the six agent keys on stock hardware).
 
-🌐 **https://openmicrokbd.org** · 🖨️ **[Printable case on MakerWorld](https://makerworld.com/en/models/3163016-openmicrokbd#profileId-3599737)** ([中国站](https://makerworld.com.cn/zh/models/2838721-openmicrokbd-kai-yuan-jian-pan)) · License: [MIT](LICENSE)
+### Knob
+- **App switcher** rotation preset: turning holds ⌘ and steps through apps (⌘Tab / ⌘⇧Tab). The selection commits when the knob rests for 0.8 s or when you press the knob.
 
-## Designed in CoHDL
+### Claude Code status light
+- `agent-hook claude-code` hooks light keys 1–2: blue pulse while working, orange flash when it needs you, green when done, red on error. Multiple sessions take turns. Ambient lighting is left alone.
 
-This board was designed in [**CoHDL**](https://cohdl.org), an open-source hardware description language that makes schematic (PCB) design AI-native: a board is a program — typed, checked, and compiled. In CoHDL, the design in [`hw/v1/src/`](hw/v1/src/) *is* the schematic; the compiler is the oracle that grades it.
+### Battery, dimming, power
+- Battery level from `device.status`, polled every 2 minutes, shown in the menu bar ("Connected · battery N%") and Settings.
+- Backlight and ambient dim to 10% after 60 s with no pad input; status keys stay bright; any input restores.
+- No traffic is sent to the pad while the Mac's display sleeps; the app catches up on wake.
+- Pad power state (idle time, standby, BLE, battery, connect/disconnect) is logged to `~/Library/Logs/OpenMicro/pad-status.log`.
 
-**CoHDL is open source.** Visit [cohdl.org](https://cohdl.org) to explore the language, or browse and contribute to the [compiler and libraries on GitHub](https://github.com/conol-ai/cohdl). This repository also checks in the complete compiler outputs under `hw/*/out/`, so the generated hardware design remains directly inspectable.
+### Other
+- Menu bar no longer shows the firmware/serial line.
+- English-only UI (language picker removed).
+- Fix: letter/digit keystroke synthesis no longer crashes on macOS (uses virtual keycodes).
+- `openmicro-app probe-rpc <file>`: runs a fixed set of read-only RPC queries and writes the replies to a file.
 
-Questions about CoHDL, the hardware source, or building a board of your own? [Join the CoHDL and OpenMicroKbd community on Discord](https://discord.gg/x7DXPvK66).
-
-## What's inside
-
-| Path | Contents |
-|---|---|
-| [`hw/v1/src/`](hw/v1/src/) | The PCB as CoHDL source: `main.cohdl` (top-level design), `openmicro_parts.cohdl` (datasheet-verified part bindings), `footprints.cohdl`, `pads.cohdl` |
-| [`hw/v1/out/`](hw/v1/out/) | Checked-in compiler output: KiCad netlist (`openmicro.net`), BOM (`openmicro-bom.csv`), SMT placement (`openmicro-smt.csv`), `.kicad_mod` footprints, layout constraints (`openmicro-layout.json`) |
-| [`hw/v1/pcb/`](hw/v1/pcb/) | The routed board — `openmicro.kicad_pcb` + KiCad project (design rules) |
-| [`hw/v1/fab/`](hw/v1/fab/) | Manufacturing package: Gerber/drill zip, assembly BOM, SMT placement CSV — see [`hw/v1/fab/README.md`](hw/v1/fab/README.md) |
-| [`hw/v1/mechanical/`](hw/v1/mechanical/) | Board outline (DXF) plus the printable enclosure parts — case, rotary knob, joystick cap, shipping tray and a solder-assembly jig, as editable Fusion 360 `.f3d` and ready-to-slice `.3mf`. Also published as a print profile on [MakerWorld](https://makerworld.com/en/models/3163016-openmicrokbd#profileId-3599737) ([中国站](https://makerworld.com.cn/zh/models/2838721-openmicrokbd-kai-yuan-jian-pan)) |
-| [`hw/v1/docs/`](hw/v1/docs/) | Manufacturer datasheets for every active, connector, and electromechanical part in the BOM, with sourcing/verification notes — see [`hw/v1/docs/README.md`](hw/v1/docs/README.md) |
-| [`hw/v2/`](hw/v2/) | **Hardware v2, in development** — wireless successor on the SiFli SF32LB52 (BLE, battery-powered): CoHDL source + compiler outputs, not yet routed. See [`hw/v2/README.md`](hw/v2/README.md) |
-| [`layout/`](layout/) | The bootloader/firmware/host contract: flash and RAM map, image header, handoff words, HID update protocol, CRC-32 — `no_std`, shared by `fw`, `boot`, `app` and `scripts/` |
-| [`boot/`](boot/) | Resident 24 KiB bootloader at 0x08000000: validates the application by length and CRC-32 before every start and offers a driverless USB HID update mode, so an interrupted update never bricks the pad. See [`boot/README.md`](boot/README.md) |
-| [`fw/`](fw/) | Firmware — Rust + [embassy](https://embassy.dev) on STM32F072CB: key matrix, twin WS2812 chains, USB HID + vendor interface, driverless updates through the resident bootloader (ROM DFU kept for migration and recovery), and an opt-in **Codex Micro compat mode** (the pad boots with the Codex Micro's USB identity and speaks ChatGPT Desktop's device protocol so the desktop app drives it natively — confirmed with Codex desktop 26.825 on macOS). See [`fw/README.md`](fw/README.md) |
-| [`app/`](app/) | Companion desktop app — Rust + [GPUI](https://gpui.rs), with a crisp 8-bit visual system: device dashboard, live connection state, and button-free firmware updates over USB. See [`app/README.md`](app/README.md) |
-
-## Hardware (v1)
-
-- **MCU:** STM32F072CBT6 (Cortex-M0), 8 MHz HSE crystal, 2×3 SWD debug socket
-- **Keys:** 13× Kailh Choc V2 low-profile switches on a 19.05 mm grid (square 4×4-cell frame, matching the Codex Micro layout), 1N4148W per-key matrix diodes
-- **Inputs:** EC11 rotary encoder, RKJXV analog joystick, capacitive touch pad
-- **Lighting:** 13× per-key SK6812MINI-E (reverse-mount, one WS2812 chain) + 8× perimeter underglow SK6812MINI-E (second chain)
-- **USB:** Type-C wired, USBLC6 ESD protection, AP2112 3.3 V LDO
-- PCB laid out from the CoHDL-generated constraints; manufacturing handoff via IPC-2581
-
-## Building
+## Build and install (macOS)
 
 ```sh
-# Production firmware binary + debug ELF
-scripts/build-firmware.sh dist
-
-# Native GPUI macOS app bundle + DMG (ad-hoc signed for local testing)
-scripts/package-macos.sh dist dist/openmicro-fw-<firmware-version>.bin
-
-# Or run the companion app from source
-cd app && cargo run --release --locked
+cd app
+cargo test --release
+cargo build --release --bin openmicro-app
+../scripts/install-local-app.sh          # → ~/Applications/OpenMicro Local.app
+open "$HOME/Applications/OpenMicro Local.app"
 ```
 
-On Windows, install Rust and Visual Studio's **Desktop development with C++**
-workload, then build a portable package from PowerShell:
+`install-local-app.sh` wraps the build in a separate app bundle (`local.sxie.OpenMicroLocal`, no auto-updates) so it doesn't clash with upstream `/Applications/OpenMicro.app`. Quit upstream OpenMicro first; both share `~/Library/Application Support/OpenMicro/config.json`.
 
-```powershell
-rustup target add x86_64-pc-windows-msvc
-./scripts/package-windows.ps1 `
-  -OutputDir dist/windows `
-  -FirmwareBin dist/openmicro-fw-<firmware-version>.bin `
-  -Target x86_64-pc-windows-msvc
-```
+The app needs **Input Monitoring** (to read the pad) and **Accessibility** (to send keystrokes). To keep those grants across rebuilds, create a self-signed code-signing certificate named **"OpenMicro Local Signing"** in your login keychain (Keychain Access → Certificate Assistant → Create a Certificate → Code Signing). The script uses it when present and falls back to ad-hoc signing otherwise; with ad-hoc signing you'll need to re-grant permissions after each build.
 
-Use `aarch64-pc-windows-msvc` for a native Windows on Arm package; that build
-also requires the Visual Studio LLVM/Clang component.
-
-The open-source [CoHDL compiler](https://github.com/conol-ai/cohdl) and its documentation are available at [cohdl.org](https://cohdl.org). Generated netlists, BOMs, footprints, and layout constraints remain checked in under `hw/*/out/` for inspection and use without rerunning the toolchain.
-
-Releases build Intel and Apple Silicon DMGs, Windows x64 and Arm64 portable
-ZIPs, and firmware through GitHub Actions. See
-[`RELEASING.md`](RELEASING.md) for versioning, Apple signing/notarization
-secrets, the required device smoke test, and the tag flow.
-Linux packaging, USB permissions, and the STM32F072 ROM-DFU host-controller
-workaround are tracked in
-[`docs/linux-firmware-updates.md`](docs/linux-firmware-updates.md).
-
-## Production files
-
-The final routed v1 board lives in [`hw/v1/pcb/`](hw/v1/pcb/) (`openmicro.kicad_pcb`, opens in KiCad 9+). The manufacturing package — Gerber/drill zip, assembly BOM, and SMT pick-and-place CSV, ready to upload to a fab such as JLCPCB — is in [`hw/v1/fab/`](hw/v1/fab/), with DRC status and ordering notes in [`hw/v1/fab/README.md`](hw/v1/fab/README.md).
-
-## Printing the case
-
-The enclosure is published as a ready-to-print model on MakerWorld, alongside the editable Fusion sources in [`hw/v1/mechanical/`](hw/v1/mechanical/):
-
-- **[MakerWorld — OpenMicroKbd](https://makerworld.com/en/models/3163016-openmicrokbd#profileId-3599737)**
-- **[MakerWorld 中国 — OpenMicroKbd 开源键盘](https://makerworld.com.cn/zh/models/2838721-openmicrokbd-kai-yuan-jian-pan)**
-
-The print covers the case, the rotary knob and the joystick cap, plus the solder-assembly jig and the shipping package as a bonus from the same project. Recommended settings: 0.4 mm nozzle, 0.2 mm layer height, 3 walls, 15–20% infill, PLA or PETG (PETG for a daily driver), **no supports required**.
-
-Beyond the print you will need an assembled PCB, Choc V2-compatible keycaps, M2×4 female-female brass standoffs, M2×5 screws, and a USB-C cable.
+## Known limits
+- Keys fire on press; no hold-to-repeat.
+- Joystick mouse mode isn't implemented for the stock pad.
+- The pad itself can wake the Mac over Bluetooth; turn it off when away if that matters.
 
 ## License
 
-[MIT](LICENSE) © 2026 Tony Huang. Build your own — attribution appreciated.
-
----
-
-*OpenMicroKbd is an independent open-source project and is not affiliated with, endorsed by, or sponsored by OpenAI. "Codex Micro" refers to OpenAI's product; all trademarks belong to their respective owners.*
+[MIT](LICENSE), as upstream (© 2026 Tony Huang). Not affiliated with OpenAI or Work Louder.
