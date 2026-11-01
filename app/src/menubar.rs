@@ -183,11 +183,13 @@ impl Menubar {
         connected: bool,
         version: &str,
         serial: &str,
+        battery: Option<(u8, bool)>,
         profiles: &[String],
         active: usize,
     ) {
         #[cfg(target_os = "linux")]
         {
+            let _ = battery;
             if let Some(commands) = &self.commands {
                 let _ = commands.send(LinuxTrayCommand::Update {
                     connected,
@@ -205,16 +207,18 @@ impl Menubar {
         else {
             return;
         };
+        // Only the Linux tray shows the firmware and serial.
         #[cfg(not(target_os = "linux"))]
-        set_tray_menu(tray, connected, version, serial, profiles, active);
+        let _ = (version, serial);
+        #[cfg(not(target_os = "linux"))]
+        set_tray_menu(tray, connected, battery, profiles, active);
     }
 }
 
 fn set_tray_menu(
     tray: &mut TrayIcon,
     connected: bool,
-    version: &str,
-    serial: &str,
+    battery: Option<(u8, bool)>,
     profiles: &[String],
     active: usize,
 ) {
@@ -228,10 +232,11 @@ fn set_tray_menu(
     let _ = menu.append(&PredefinedMenuItem::separator());
     let status = MenuItem::with_id(
         "status",
-        if connected {
-            "●  Connected"
-        } else {
-            "○  No pad found"
+        match (connected, battery) {
+            (true, Some((percent, true))) => format!("●  Connected · battery {percent}% (charging)"),
+            (true, Some((percent, false))) => format!("●  Connected · battery {percent}%"),
+            (true, None) => "●  Connected".to_string(),
+            (false, _) => "○  No pad found".to_string(),
         },
         false,
         None,
@@ -257,14 +262,5 @@ fn set_tray_menu(
         true,
         None,
     ));
-    if connected {
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id(
-            "fw",
-            format!("firmware {version} · serial {serial}"),
-            false,
-            None,
-        ));
-    }
     tray.set_menu(Some(Box::new(menu)));
 }

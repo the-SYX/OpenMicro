@@ -15,7 +15,10 @@ use openmicro_layout::BootInfoReply;
 
 use crate::actions;
 use crate::behaviors;
-use crate::config::{self, Action, AppConfig, LedPattern, Profile, ProfileMode, SLOT_COUNT};
+use crate::config::{
+    self, Action, AppConfig, InputConfig, LedPattern, MediaOp, Profile, ProfileLighting, ProfileMode, Slot, SlotKind,
+    KEY_SLOTS, SLOT_COUNT,
+};
 use crate::device::{BootloaderError, DeviceCmd, DeviceMode, DeviceMsg, PadEvent, UpdateMsg};
 use crate::events::AppEvent;
 use crate::intercept::Intercept;
@@ -39,7 +42,11 @@ pub const MOMENTARY_RELEASE_DELAY: Duration = Duration::from_millis(250);
 const LOG_LIMIT: usize = 8;
 const TERMINAL_LED_TTL: Duration = Duration::from_secs(4);
 const ACTIVE_LED_TTL: Duration = Duration::from_secs(30 * 60);
-const AGENT_LED_INDICES: [u8; 4] = [2, 3, 4, 5];
+// (key index, agent) pairs. Claude Code lights both top-row keys; the other
+// agents keep their second-row keys.
+const AGENT_LED_KEYS: [(usize, usize); 5] = [(0, 0), (1, 0), (3, 1), (4, 2), (5, 3)];
+/// Working breathes over eight 300 ms frames (percent of full brightness).
+const WORKING_PULSE: [u16; 8] = [100, 80, 55, 30, 15, 30, 55, 80];
 const AGENT_NAMESPACES: [&str; 4] = ["claude-code:", "codex:", "grok:", "octoscode:"];
 
 fn pattern_rgb(pattern: LedPattern) -> (u8, u8, u8) {
@@ -50,7 +57,25 @@ fn pattern_rgb(pattern: LedPattern) -> (u8, u8, u8) {
     }
 }
 
+/// Consumer usages the host can reproduce as a media key.
+fn consumer_media_op(usage: u16) -> Option<MediaOp> {
+    Some(match usage {
+        0xE9 => MediaOp::VolumeUp,
+        0xEA => MediaOp::VolumeDown,
+        0xE2 => MediaOp::Mute,
+        0xCD => MediaOp::PlayPause,
+        0xB5 => MediaOp::NextTrack,
+        0xB6 => MediaOp::PrevTrack,
+        0x6F => MediaOp::BrightnessUp,
+        0x70 => MediaOp::BrightnessDown,
+        _ => return None,
+    })
+}
+
 fn supports_agent_leds(version: &str) -> bool {
+    if crate::stock::is_stock_version(version) {
+        return true;
+    }
     let mut parts = version
         .split('.')
         .filter_map(|part| part.parse::<u32>().ok());
@@ -107,6 +132,8 @@ pub struct HostState {
     pub connected: bool,
     /// Last connected `(firmware version, serial)` pair.
     pub last_conn: Option<(String, String)>,
+    /// The pad's battery percentage and charging state, when it reports one.
+    pub battery: Option<(u8, bool)>,
     /// The connected pad's boot identity; None while disconnected or on
     /// firmware that predates device modes.
     pub device_mode: Option<DeviceMode>,
@@ -126,7 +153,20 @@ pub struct HostState {
     activities: HashMap<String, SessionActivity>,
     activity_epoch: u64,
     activity_led_frame: usize,
-    agent_leds_dirty: bool,
+    /// Last per-key LED override sent to the pad. A fresh connection has
+    /// none (overrides are runtime-only), so nothing is sent until one is set.
+    key_led_sent: [Option<Option<(u8, u8, u8)>>; KEY_SLOTS],
+    /// The last frontmost app reported, so profiles switch only when the
+    /// front app changes and a manual switch sticks until then.
+    last_front_app: Option<String>,
+    /// The hold layer being edited, by trigger slot. While set, the active
+    /// profile's `inputs` and that layer's `inputs` are swapped so every
+    /// editor works on the layer unchanged; `stored_config` undoes the swap
+    /// for saving and the pad.
+    pub editing_layer: Option<usize>,
+    /// The hold-layer key currently held on the pad, and whether another
+    /// control was used while it was down (a bare tap runs its own action).
+    held_layer: Option<(usize, bool)>,
 
     pub intercept: Option<Intercept>,
     pub menubar: Option<Menubar>,
@@ -214,6 +254,7 @@ impl HostState {
             device_tx: None,
             connected: false,
             last_conn: None,
+            battery: None,
             device_mode: None,
             boot_info: None,
             bootloader: None,
@@ -222,7 +263,10 @@ impl HostState {
             activities: HashMap::new(),
             activity_epoch: 0,
             activity_led_frame: 0,
-            agent_leds_dirty: false,
+            key_led_sent: [Some(None); KEY_SLOTS],
+            last_front_app: None,
+            editing_layer: None,
+            held_layer: None,
             intercept: None,
             menubar: None,
             release: None,
@@ -273,6 +317,7 @@ impl HostState {
     }
 
     fn select_profile_for_current_mode(&mut self) {
+        self.exit_layer_edit();
         let mode = self.current_profile_mode();
         let original = self.config.active_profile;
         let original_len = self.config.profiles.len();
@@ -344,7 +389,7 @@ impl HostState {
     /// active profile. Detached states intentionally skip the disk write.
     pub fn persist(&mut self) -> Result<(), String> {
         let result = if self.persist_to_disk {
-            config::save(&self.config)
+            config::save(&self.stored_config())
         } else {
             Ok(())
         };
@@ -378,20 +423,194 @@ impl HostState {
             joy_mode: profile.analog.joy_mode,
             joy_mouse_speed: profile.analog.joy_mouse_speed,
             led_brightness: self.config.led_brightness,
-            led_key_pattern: self.config.led_key_pattern,
-            led_ambient_pattern: self.config.led_ambient_pattern,
+            led_key_pattern: self.key_pattern(),
+            led_ambient_pattern: self.ambient_pattern(),
         })
         .is_ok()
             && self.refresh_activity_led()
     }
 
     fn active_device_profile(&self) -> Profile {
-        let profile = self.active_profile();
+        let profile = self.effective_profile();
         if self.device_mode == Some(DeviceMode::Codex) {
-            behaviors::with_codex_overrides(profile)
+            behaviors::with_codex_overrides(&profile)
         } else {
-            profile.clone()
+            profile
         }
+    }
+
+    /// The default profile when the active one is some other profile, i.e.
+    /// the profile its empty inputs and unset colours fall back to.
+    fn fallback_profile(&self) -> Option<&Profile> {
+        let index = self.default_profile_index()?;
+        (index != self.config.active_profile).then(|| &self.config.profiles[index])
+    }
+
+    /// Whether the active control editor has something to fall back to:
+    /// the default profile, or the base bindings while editing a layer.
+    pub fn has_fallback(&self) -> bool {
+        self.editing_layer.is_some() || self.fallback_profile().is_some()
+    }
+
+    /// The config as saved: with any hold-layer edit swap undone.
+    pub fn stored_config(&self) -> std::borrow::Cow<'_, AppConfig> {
+        if self.editing_layer.is_none() {
+            return std::borrow::Cow::Borrowed(&self.config);
+        }
+        let mut config = self.config.clone();
+        let active = config.active_profile;
+        unswap_layer(&mut config.profiles[active], self.editing_layer);
+        std::borrow::Cow::Owned(config)
+    }
+
+    /// The active profile as stored (base bindings, not a layer being edited).
+    fn stored_profile(&self) -> Profile {
+        let mut profile = self.active_profile().clone();
+        unswap_layer(&mut profile, self.editing_layer);
+        profile
+    }
+
+    pub fn has_layer(&self, trigger: usize) -> bool {
+        self.active_profile().layers.iter().any(|layer| layer.trigger == trigger)
+    }
+
+    /// Turn `trigger` into a hold-layer key, or back into a plain key.
+    pub fn toggle_layer(&mut self, trigger: usize) {
+        if trigger >= KEY_SLOTS {
+            return;
+        }
+        self.exit_layer_edit();
+        let profile = self.active_profile_mut();
+        if let Some(index) = profile.layers.iter().position(|layer| layer.trigger == trigger) {
+            profile.layers.remove(index);
+        } else {
+            profile.layers.push(config::HoldLayer::new(trigger));
+        }
+        let _ = self.persist();
+        self.sync_device();
+    }
+
+    /// Point the editors at `trigger`'s layer.
+    pub fn enter_layer_edit(&mut self, trigger: usize) {
+        if self.editing_layer == Some(trigger) || !self.has_layer(trigger) {
+            return;
+        }
+        self.exit_layer_edit();
+        let profile = self.active_profile_mut();
+        if let Some(layer) = profile.layers.iter_mut().find(|layer| layer.trigger == trigger) {
+            std::mem::swap(&mut profile.inputs, &mut layer.inputs);
+            self.editing_layer = Some(trigger);
+        }
+    }
+
+    pub fn exit_layer_edit(&mut self) {
+        let editing = self.editing_layer.take();
+        if editing.is_some() {
+            let active = self.config.active_profile;
+            unswap_layer(&mut self.config.profiles[active], editing);
+        }
+    }
+
+    /// The binding an empty control falls back to in the current editor.
+    fn fallback_input(&self, slot: usize) -> Option<InputConfig> {
+        if self.editing_layer.is_some() {
+            return self.stored_profile().inputs.get(slot).cloned();
+        }
+        self.fallback_profile()?.inputs.get(slot).cloned()
+    }
+
+    /// Where a control's binding comes from in the active profile.
+    pub fn input_source(&self, slots: &[usize]) -> InputSource {
+        let inputs = &self.active_profile().inputs;
+        if slots.iter().all(|&slot| inputs[slot].action == Action::Disabled) {
+            InputSource::Disabled
+        } else if slots.iter().all(|&slot| inputs[slot].is_unbound()) {
+            InputSource::Default
+        } else {
+            InputSource::Own
+        }
+    }
+
+    /// Cycle a control between following the default profile, its own
+    /// binding (starting from a copy of the default's) and doing nothing.
+    pub fn cycle_input_source(&mut self, slots: &[usize]) {
+        let next = match self.input_source(slots) {
+            InputSource::Default => InputSource::Own,
+            InputSource::Own => InputSource::Disabled,
+            InputSource::Disabled => InputSource::Default,
+        };
+        let inherited: Vec<InputConfig> = slots
+            .iter()
+            .map(|&slot| self.fallback_input(slot).unwrap_or_else(config::unbound_input))
+            .collect();
+        let inputs = &mut self.active_profile_mut().inputs;
+        for (&slot, inherited) in slots.iter().zip(inherited) {
+            inputs[slot] = match next {
+                InputSource::Default => config::unbound_input(),
+                InputSource::Own => inherited,
+                InputSource::Disabled => InputConfig {
+                    action: Action::Disabled,
+                    ..config::unbound_input()
+                },
+            };
+        }
+    }
+
+    /// What `slot` inherits from the default profile, when the active
+    /// profile leaves it empty.
+    pub fn inherited_input(&self, slot: usize) -> Option<InputConfig> {
+        let own = self.active_profile().inputs.get(slot)?;
+        if !own.is_unbound() {
+            return None;
+        }
+        self.fallback_input(slot).filter(|inherited| !inherited.is_unbound())
+    }
+
+    /// The active profile with empty inputs filled from the default profile
+    /// and "Do nothing" inputs cleared, as the pad and host should run it.
+    pub fn effective_profile(&self) -> Profile {
+        let mut profile = self.stored_profile();
+        if let Some(fallback) = self.fallback_profile() {
+            for (input, inherited) in profile.inputs.iter_mut().zip(&fallback.inputs) {
+                if input.is_unbound() {
+                    *input = inherited.clone();
+                }
+            }
+            // Hold layers the profile doesn't define come from the default.
+            for layer in &fallback.layers {
+                if !profile.layers.iter().any(|own| own.trigger == layer.trigger) {
+                    profile.layers.push(layer.clone());
+                }
+            }
+        }
+        for input in &mut profile.inputs {
+            if input.action == Action::Disabled {
+                input.emitted = Slot::default();
+                input.action = Action::None;
+            }
+        }
+        profile.lighting = self.effective_lighting();
+        profile
+    }
+
+    /// The active profile's lighting, with unset key colours (or all of it)
+    /// taken from the default profile.
+    fn effective_lighting(&self) -> Option<ProfileLighting> {
+        let own = self.active_profile().lighting.clone();
+        let Some(inherited) = self.fallback_profile().and_then(|p| p.lighting.clone()) else {
+            return own;
+        };
+        let Some(mut own) = own else {
+            return Some(inherited);
+        };
+        for index in 0..KEY_SLOTS {
+            if own.key_color(index).is_none() {
+                if let Some(color) = inherited.key_color(index) {
+                    own.set_key_color(index, Some(color));
+                }
+            }
+        }
+        Some(own)
     }
 
     pub fn select_slot(&mut self, slot: usize) -> bool {
@@ -406,15 +625,87 @@ impl HostState {
     /// with the existing ones, and return its index. Nothing is persisted or
     /// activated here; `switch_profile` does both.
     pub fn add_profile(&mut self, template: config::ProfileTemplate) -> usize {
+        self.exit_layer_edit();
         let mut profile = template.profile(&self.config.profiles);
         profile.mode = self.current_profile_mode();
+        profile.is_default = false;
+        profile.apps.clear();
+        profile.layers.clear();
         self.config.profiles.push(profile);
         self.config.profiles.len() - 1
+    }
+
+    /// The profile used when the frontmost app has no profile of its own.
+    pub fn default_profile_index(&self) -> Option<usize> {
+        let visible = self.visible_profile_indices();
+        visible
+            .iter()
+            .copied()
+            .find(|&index| self.config.profiles[index].is_default)
+            .or_else(|| visible.first().copied())
+    }
+
+    /// Make `index` the default for its mode.
+    pub fn set_default_profile(&mut self, index: usize) {
+        let Some(mode) = self.config.profiles.get(index).map(|p| p.mode) else {
+            return;
+        };
+        for (i, profile) in self.config.profiles.iter_mut().enumerate() {
+            if profile.mode == mode {
+                profile.is_default = i == index;
+            }
+        }
+        let _ = self.persist();
+    }
+
+    /// Link `path` to the active profile, unlinking it from any other.
+    pub fn link_app(&mut self, path: &str) {
+        let active = self.config.active_profile;
+        for (i, profile) in self.config.profiles.iter_mut().enumerate() {
+            profile.apps.retain(|app| app != path);
+            if i == active {
+                profile.apps.push(path.to_string());
+            }
+        }
+        let _ = self.persist();
+    }
+
+    pub fn unlink_app(&mut self, path: &str) {
+        self.active_profile_mut().apps.retain(|app| app != path);
+        let _ = self.persist();
+    }
+
+    /// Follow the frontmost app: its linked profile, else the default.
+    /// Returns true when the active profile changed.
+    pub fn on_frontmost_app(&mut self, path: Option<&str>) -> bool {
+        let Some(path) = path else {
+            return false;
+        };
+        if !self.config.auto_switch || is_own_app(path) {
+            return false;
+        }
+        if self.last_front_app.as_deref() == Some(path) {
+            return false;
+        }
+        self.last_front_app = Some(path.to_string());
+        let target = self
+            .visible_profile_indices()
+            .into_iter()
+            .find(|&index| self.config.profiles[index].apps.iter().any(|app| app == path))
+            .or_else(|| self.default_profile_index());
+        let before = self.config.active_profile;
+        match target {
+            Some(index) => self.switch_profile(index) && self.config.active_profile != before,
+            None => false,
+        }
     }
 
     /// Activate a profile, persist it, update host interception/menu state,
     /// and make the pad follow the switch.
     pub fn switch_profile(&mut self, index: usize) -> bool {
+        if self.config.active_profile != index {
+            self.exit_layer_edit();
+        }
         if index >= self.config.profiles.len() {
             return false;
         }
@@ -552,7 +843,7 @@ impl HostState {
             Some(DeviceMode::Codex) => format!("{version} · Codex Micro mode"),
             _ => version,
         };
-        menubar.update(self.connected, &version, &serial, &names, active);
+        menubar.update(self.connected, &version, &serial, self.battery, &names, active);
     }
 
     fn handle_device(&mut self, message: DeviceMsg, effects: &mut Vec<HostEffect>) {
@@ -564,6 +855,7 @@ impl HostState {
                 boot,
             } => {
                 self.connected = true;
+                self.key_led_sent = [Some(None); KEY_SLOTS];
                 self.last_conn = Some((version, serial));
                 self.device_mode = mode;
                 self.select_profile_for_current_mode();
@@ -580,6 +872,7 @@ impl HostState {
             DeviceMsg::Disconnected => {
                 self.connected = false;
                 self.last_conn = None;
+                self.battery = None;
                 self.device_mode = None;
                 self.boot_info = None;
                 self.pressed_cells.fill(false);
@@ -631,8 +924,8 @@ impl HostState {
                     || joy_mode != profile.analog.joy_mode
                     || joy_mouse_speed != profile.analog.joy_mouse_speed
                     || led_brightness != self.config.led_brightness
-                    || led_key_pattern != self.config.led_key_pattern
-                    || led_ambient_pattern != self.config.led_ambient_pattern;
+                    || led_key_pattern != self.key_pattern()
+                    || led_ambient_pattern != self.ambient_pattern();
                 if differs {
                     self.push_log("pad keymap differs from the active profile — syncing");
                     self.sync_device();
@@ -646,6 +939,91 @@ impl HostState {
                     self.push_log(format!("pad sync failed: {detail}"));
                 }
             }
+            DeviceMsg::HostInput { slot, pressed } => self.handle_host_input(slot, pressed, effects),
+            DeviceMsg::Battery { percent, charging } => {
+                if self.battery != Some((percent, charging)) {
+                    self.battery = Some((percent, charging));
+                    self.refresh_menubar();
+                }
+            }
+        }
+    }
+
+    /// A stock-firmware pad emits nothing itself, so the host does what the
+    /// firmware keymap would have: run the slot's action, or else type the
+    /// code it is set to emit.
+    /// Route a stock-pad input through hold layers: a layer key runs nothing
+    /// on press; controls used while it is held run the layer's binding (or
+    /// the normal one where the layer is empty); releasing a layer key that
+    /// was only tapped runs its own binding.
+    fn handle_host_input(&mut self, slot: usize, pressed: bool, effects: &mut Vec<HostEffect>) {
+        // Pressing the knob while the app switcher is open picks the app.
+        if slot == config::SLOT_ENC_PRESS && pressed && actions::commit_app_switch() {
+            return;
+        }
+        let profile = self.active_device_profile();
+        let is_trigger = profile.layers.iter().any(|layer| layer.trigger == slot);
+        if is_trigger {
+            if pressed {
+                self.held_layer = Some((slot, false));
+            } else if let Some((held, used)) = self.held_layer {
+                if held == slot {
+                    self.held_layer = None;
+                    if !used {
+                        self.run_host_input(slot, effects);
+                    }
+                }
+            }
+            return;
+        }
+        if !pressed {
+            return;
+        }
+        if let Some((held, _)) = self.held_layer {
+            self.held_layer = Some((held, true));
+            let layered = profile
+                .layers
+                .iter()
+                .find(|layer| layer.trigger == held)
+                .and_then(|layer| layer.inputs.get(slot))
+                .filter(|input| !input.is_unbound())
+                .cloned();
+            if let Some(input) = layered {
+                self.run_input(input, effects);
+                return;
+            }
+        }
+        self.run_host_input(slot, effects);
+    }
+
+    fn run_host_input(&mut self, slot: usize, effects: &mut Vec<HostEffect>) {
+        let Some(input) = self.active_device_profile().inputs.get(slot).cloned() else {
+            return;
+        };
+        self.run_input(input, effects);
+    }
+
+    fn run_input(&mut self, input: InputConfig, effects: &mut Vec<HostEffect>) {
+        match input.action {
+            Action::AppSettings => push_open_settings(effects),
+            Action::None => {
+                let emitted = input.emitted;
+                match emitted.kind {
+                    SlotKind::None => {}
+                    SlotKind::Keyboard => actions::execute(&Action::Keystroke {
+                        mods: emitted.mods,
+                        key: emitted.code,
+                    }),
+                    SlotKind::Consumer => match consumer_media_op(emitted.code) {
+                        Some(op) => actions::execute(&Action::Media { op }),
+                        None => self.push_log(format!(
+                            "consumer usage 0x{:02X} can't be sent from the Mac",
+                            emitted.code
+                        )),
+                    },
+                }
+            }
+            action => actions::execute(&action),
         }
     }
 
@@ -735,7 +1113,7 @@ impl HostState {
         let status = self.activity_status();
         let (status_key_pattern, ambient_pattern) = status
             .patterns_with(&self.config.activity_status_colors)
-            .unwrap_or((self.config.led_key_pattern, self.config.led_ambient_pattern));
+            .unwrap_or((self.key_pattern(), self.ambient_pattern()));
         let mapped_active = self
             .last_conn
             .as_ref()
@@ -749,23 +1127,71 @@ impl HostState {
                 // Legacy/generic integrations keep the original whole-keyboard
                 // status behavior. The four mapped agents use dedicated keys.
                 key_pattern: if mapped_active {
-                    self.config.led_key_pattern
+                    self.key_pattern()
                 } else {
                     status_key_pattern
                 },
-                ambient_pattern,
+                // A mapped agent shows its status on its own keys only; the
+                // ambient light keeps its own colour.
+                ambient_pattern: if mapped_active {
+                    self.ambient_pattern()
+                } else {
+                    ambient_pattern
+                },
             })
             .is_ok();
-        if mapped_active || self.agent_leds_dirty {
-            for (agent, index) in AGENT_LED_INDICES.into_iter().enumerate() {
-                let color = self.agent_led_color(agent).map(pattern_rgb);
-                sent &= tx
-                    .send(DeviceCmd::SetKeyLedOverride { index, color })
+        // Per-key colours: a mapped agent's status wins on its key, else the
+        // profile's own colour for that key. Only changes are sent.
+        let lighting = self.effective_lighting().unwrap_or_default();
+        for index in 0..KEY_SLOTS {
+            let agent = AGENT_LED_KEYS
+                .iter()
+                .find(|(key, _)| *key == index)
+                .map(|(_, agent)| *agent);
+            let color = agent
+                .filter(|_| mapped_active)
+                .and_then(|agent| self.agent_led_color(agent))
+                .map(pattern_rgb)
+                .or_else(|| lighting.key_color(index));
+            if self.key_led_sent[index] != Some(color) {
+                let ok = tx
+                    .send(DeviceCmd::SetKeyLedOverride {
+                        index: index as u8,
+                        color,
+                    })
                     .is_ok();
+                sent &= ok;
+                if ok {
+                    self.key_led_sent[index] = Some(color);
+                }
             }
         }
-        self.agent_leds_dirty = mapped_active;
         sent
+    }
+
+    /// The active profile's key backlight, or the global one.
+    pub fn key_pattern(&self) -> LedPattern {
+        self.effective_lighting()
+            .map_or(self.config.led_key_pattern, |l| l.key_pattern)
+    }
+
+    /// The active profile's ambient light, or the global one.
+    pub fn ambient_pattern(&self) -> LedPattern {
+        self.effective_lighting()
+            .map_or(self.config.led_ambient_pattern, |l| l.ambient_pattern)
+    }
+
+    /// The active profile's lighting, created on first edit from what it
+    /// currently shows (the default profile's, or the global settings).
+    pub fn active_lighting_mut(&mut self) -> &mut ProfileLighting {
+        let (key_pattern, ambient_pattern) = (self.key_pattern(), self.ambient_pattern());
+        self.active_profile_mut()
+            .lighting
+            .get_or_insert_with(|| ProfileLighting {
+                key_pattern,
+                ambient_pattern,
+                key_colors: Vec::new(),
+            })
     }
 
     /// Advance the deterministic per-agent session carousel by one 300 ms
@@ -774,6 +1200,29 @@ impl HostState {
     pub fn advance_activity_led_frame(&mut self) -> bool {
         self.activity_led_frame = self.activity_led_frame.wrapping_add(1);
         self.refresh_activity_led()
+    }
+
+    /// A status colour for the current frame: Working breathes, Attention
+    /// flashes on and off, Success and Error hold steady until they expire.
+    fn animated_status_color(&self, status: ActivityStatus) -> LedPattern {
+        let color = self.config.activity_status_colors.get(status);
+        let frame = self.activity_led_frame;
+        let percent = match status {
+            ActivityStatus::Working => WORKING_PULSE[frame % WORKING_PULSE.len()],
+            ActivityStatus::Attention if frame % 2 == 1 => 0,
+            _ => 100,
+        };
+        let (r, g, b) = match color {
+            LedPattern::Solid { r, g, b } => (r, g, b),
+            LedPattern::White => (255, 255, 255),
+            LedPattern::Rainbow => return color,
+        };
+        let scale = |c: u8| (c as u16 * percent / 100) as u8;
+        LedPattern::Solid {
+            r: scale(r),
+            g: scale(g),
+            b: scale(b),
+        }
     }
 
     fn agent_led_color(&self, agent: usize) -> Option<LedPattern> {
@@ -787,8 +1236,13 @@ impl HostState {
         if sessions.is_empty() {
             return None;
         }
-        if sessions.len() == 1 {
-            return Some(self.config.activity_status_colors.get(sessions[0].1.status));
+        // Claude shows its most urgent session; others show a lone session.
+        if agent == 0 || sessions.len() == 1 {
+            let status = sessions
+                .iter()
+                .map(|(_, activity)| activity.status)
+                .max_by_key(|status| status.priority())?;
+            return Some(self.animated_status_color(status));
         }
 
         let overflow = sessions.len() > 4;
@@ -973,7 +1427,7 @@ impl HostState {
             .unwrap_or_default();
 
         for slot in slots {
-            let Some(input) = self.active_profile().inputs.get(slot).cloned() else {
+            let Some(input) = self.active_device_profile().inputs.get(slot).cloned() else {
                 continue;
             };
             // Synthesized chords re-enter the global grab. Consuming the
@@ -1066,6 +1520,37 @@ fn push_open_settings(effects: &mut Vec<HostEffect>) {
     }
 }
 
+/// Put a profile's base inputs back from the layer being edited.
+fn unswap_layer(profile: &mut Profile, editing: Option<usize>) {
+    let Some(trigger) = editing else {
+        return;
+    };
+    if let Some(layer) = profile.layers.iter_mut().find(|layer| layer.trigger == trigger) {
+        std::mem::swap(&mut profile.inputs, &mut layer.inputs);
+    }
+}
+
+/// Where a control's binding comes from in a non-default profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSource {
+    /// Empty here, so the default profile's binding runs.
+    Default,
+    /// Bound in this profile.
+    Own,
+    /// Explicitly does nothing in this profile.
+    Disabled,
+}
+
+/// True when `path` is this app (its bundle, or the bare binary when run
+/// outside one), so focusing our own window never switches profiles.
+fn is_own_app(path: &str) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let exe = exe.to_string_lossy();
+    exe == path || exe.starts_with(&format!("{}/", path.trim_end_matches('/')))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -1101,6 +1586,166 @@ mod tests {
         }));
         assert_eq!(host.config.active_profile, openmicro_profile);
         assert_eq!(host.active_profile().mode, ProfileMode::OpenMicro);
+    }
+
+    #[test]
+    fn the_front_app_picks_its_linked_profile_else_the_default() {
+        let mut host = state();
+        let default = host.config.active_profile;
+        let zoom = host.add_profile(config::ProfileTemplate::Empty);
+        host.switch_profile(zoom);
+        host.link_app("/Applications/Zoom.app");
+        host.switch_profile(default);
+
+        assert!(host.on_frontmost_app(Some("/Applications/Zoom.app")));
+        assert_eq!(host.config.active_profile, zoom);
+        assert!(host.on_frontmost_app(Some("/System/Applications/Notes.app")));
+        assert_eq!(host.config.active_profile, default);
+    }
+
+    #[test]
+    fn a_manual_switch_sticks_until_the_front_app_changes() {
+        let mut host = state();
+        let other = host.add_profile(config::ProfileTemplate::Empty);
+        host.on_frontmost_app(Some("/Applications/Safari.app"));
+        host.switch_profile(other);
+
+        assert!(!host.on_frontmost_app(Some("/Applications/Safari.app")));
+        assert_eq!(host.config.active_profile, other);
+        assert!(host.on_frontmost_app(Some("/Applications/Mail.app")));
+        assert_ne!(host.config.active_profile, other);
+    }
+
+    #[test]
+    fn auto_switch_off_and_our_own_window_leave_the_profile_alone() {
+        let mut host = state();
+        let other = host.add_profile(config::ProfileTemplate::Empty);
+        host.switch_profile(other);
+
+        let own = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        assert!(!host.on_frontmost_app(Some(&own)));
+        assert_eq!(host.config.active_profile, other);
+
+        host.config.auto_switch = false;
+        assert!(!host.on_frontmost_app(Some("/Applications/Mail.app")));
+        assert_eq!(host.config.active_profile, other);
+    }
+
+    #[test]
+    fn linking_an_app_moves_it_and_one_default_is_kept_per_mode() {
+        let mut host = state();
+        let first = host.config.active_profile;
+        let second = host.add_profile(config::ProfileTemplate::Empty);
+        host.link_app("/Applications/Zoom.app");
+        host.switch_profile(second);
+        host.link_app("/Applications/Zoom.app");
+        assert!(host.config.profiles[first].apps.is_empty());
+        assert_eq!(host.config.profiles[second].apps, ["/Applications/Zoom.app"]);
+
+        assert_eq!(host.default_profile_index(), Some(first));
+        host.set_default_profile(second);
+        assert_eq!(host.default_profile_index(), Some(second));
+        assert!(!host.config.profiles[first].is_default);
+    }
+
+    #[test]
+    fn empty_inputs_follow_the_default_profile_and_do_nothing_blocks_them() {
+        let mut host = state();
+        let default = host.config.active_profile;
+        let bound: Vec<usize> = (0..SLOT_COUNT)
+            .filter(|&slot| !host.config.profiles[default].inputs[slot].is_unbound())
+            .take(2)
+            .collect();
+        let (inherit, blocked) = (bound[0], bound[1]);
+        let app = host.add_profile(config::ProfileTemplate::Empty);
+        host.switch_profile(app);
+
+        let effective = host.effective_profile();
+        assert_eq!(effective.inputs[inherit], host.config.profiles[default].inputs[inherit]);
+        assert!(host.inherited_input(inherit).is_some());
+        assert_eq!(host.input_source(&[inherit]), InputSource::Default);
+
+        host.cycle_input_source(&[blocked]); // Default -> Own (a copy)
+        assert_eq!(host.input_source(&[blocked]), InputSource::Own);
+        assert_eq!(host.active_profile().inputs[blocked], host.config.profiles[default].inputs[blocked]);
+        host.cycle_input_source(&[blocked]); // Own -> Do nothing
+        assert_eq!(host.input_source(&[blocked]), InputSource::Disabled);
+        assert!(host.effective_profile().inputs[blocked].is_unbound());
+        host.cycle_input_source(&[blocked]); // back to Default
+        assert_eq!(host.input_source(&[blocked]), InputSource::Default);
+
+        // The default profile itself never inherits.
+        host.switch_profile(default);
+        assert!(host.inherited_input(inherit).is_none());
+    }
+
+    #[test]
+    fn unset_lighting_follows_the_default_profile() {
+        let red = LedPattern::Solid { r: 255, g: 0, b: 0 };
+        let mut host = state();
+        host.active_lighting_mut().ambient_pattern = red;
+        host.active_lighting_mut().set_key_color(1, Some((0, 255, 60)));
+        let app = host.add_profile(config::ProfileTemplate::Empty);
+        host.switch_profile(app);
+        assert_eq!(host.ambient_pattern(), red);
+
+        host.active_lighting_mut().set_key_color(0, Some((0, 0, 255)));
+        let lighting = host.effective_profile().lighting.unwrap();
+        assert_eq!(lighting.key_color(0), Some((0, 0, 255)));
+        assert_eq!(lighting.key_color(1), Some((0, 255, 60)));
+        assert_eq!(lighting.ambient_pattern, red);
+    }
+
+    fn host_press(host: &mut HostState, slot: usize, pressed: bool) -> Vec<HostEffect> {
+        let mut effects = Vec::new();
+        host.handle_host_input(slot, pressed, &mut effects);
+        effects
+    }
+
+    #[test]
+    fn a_hold_layer_rebinds_controls_and_a_bare_tap_runs_the_key() {
+        let settings = InputConfig {
+            action: Action::AppSettings,
+            ..config::unbound_input()
+        };
+        let mut host = state();
+        let profile = host.add_profile(config::ProfileTemplate::Empty);
+        host.switch_profile(profile);
+        host.set_default_profile(profile);
+        host.active_profile_mut().inputs[0] = settings.clone();
+        host.toggle_layer(0);
+        host.enter_layer_edit(0);
+        host.active_profile_mut().inputs[config::SLOT_JOY_LEFT] = settings.clone();
+        host.exit_layer_edit();
+        assert_eq!(host.active_profile().inputs[0], settings);
+        assert!(host.active_profile().inputs[config::SLOT_JOY_LEFT].is_unbound());
+
+        // Hold + left runs the layer binding; releasing doesn't tap the key.
+        assert!(host_press(&mut host, 0, true).is_empty());
+        assert_eq!(host_press(&mut host, config::SLOT_JOY_LEFT, true), [HostEffect::OpenSettings]);
+        assert!(host_press(&mut host, 0, false).is_empty());
+        // Left without the hold key uses the (empty) normal binding.
+        assert!(host_press(&mut host, config::SLOT_JOY_LEFT, true).is_empty());
+        // A bare tap of the hold key runs its own binding on release.
+        assert!(host_press(&mut host, 0, true).is_empty());
+        assert_eq!(host_press(&mut host, 0, false), [HostEffect::OpenSettings]);
+    }
+
+    #[test]
+    fn editing_a_layer_never_saves_or_syncs_the_swapped_inputs() {
+        let mut host = state();
+        let base = host.active_profile().inputs.clone();
+        host.toggle_layer(1);
+        host.enter_layer_edit(1);
+        assert!(host.active_profile().inputs.iter().all(InputConfig::is_unbound));
+        assert_eq!(host.stored_config().profiles[host.config.active_profile].inputs, base);
+        assert_eq!(host.effective_profile().inputs, base);
+
+        // Switching profile ends the edit and restores the base inputs.
+        let other = host.add_profile(config::ProfileTemplate::Empty);
+        assert_eq!(host.editing_layer, None);
+        host.switch_profile(other);
+        assert_eq!(host.config.profiles[0].inputs, base);
     }
 
     #[test]
@@ -1520,32 +2165,133 @@ mod tests {
                 status,
                 begins_turn: true,
             }));
-            while rx.try_recv().is_ok() {}
         }
-
         host.refresh_activity_led();
-        assert!(matches!(
-            rx.recv().unwrap(),
-            DeviceCmd::SetTransientLedPattern { .. }
-        ));
-        let expected = [
-            (2, Some((255, 150, 0))),
-            (3, Some((0, 96, 255))),
-            (4, Some((0, 210, 90))),
-            (5, Some((255, 30, 50))),
-        ];
-        for (index, color) in expected {
-            match rx.recv().unwrap() {
-                DeviceCmd::SetKeyLedOverride {
-                    index: actual,
-                    color: actual_color,
-                } => {
-                    assert_eq!(actual, index);
-                    assert_eq!(actual_color, color);
-                }
-                _ => panic!("unexpected agent LED command"),
+
+        // Overrides are sent only on change, so check each key's latest.
+        let latest = latest_key_overrides(&rx);
+        assert_eq!(latest[0], Some(Some((255, 150, 0))));
+        assert_eq!(latest[1], Some(Some((255, 150, 0))));
+        assert_eq!(latest[3], Some(Some((0, 96, 255))));
+        assert_eq!(latest[4], Some(Some((0, 210, 90))));
+        assert_eq!(latest[5], Some(Some((255, 30, 50))));
+    }
+
+    /// Drain the queue; per key index, the last override colour sent.
+    fn latest_key_overrides(
+        rx: &mpsc::Receiver<DeviceCmd>,
+    ) -> [Option<Option<(u8, u8, u8)>>; KEY_SLOTS] {
+        let mut latest = [None; KEY_SLOTS];
+        while let Ok(cmd) = rx.try_recv() {
+            if let DeviceCmd::SetKeyLedOverride { index, color } = cmd {
+                latest[index as usize] = Some(color);
             }
         }
+        latest
+    }
+
+    #[test]
+    fn profile_lighting_overrides_the_global_patterns() {
+        let mut host = state();
+        let (tx, rx) = mpsc::channel();
+        host.device_tx = Some(tx);
+        host.config.led_key_pattern = LedPattern::Rainbow;
+        host.config.led_ambient_pattern = LedPattern::Rainbow;
+        let red = LedPattern::Solid { r: 255, g: 0, b: 0 };
+        let blue = LedPattern::Solid { r: 0, g: 80, b: 255 };
+        {
+            let lighting = host.active_lighting_mut();
+            lighting.key_pattern = red;
+            lighting.ambient_pattern = blue;
+            lighting.set_key_color(1, Some((0, 255, 60)));
+        }
+        host.sync_device();
+        let mut synced = None;
+        let mut latest = [None; KEY_SLOTS];
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                DeviceCmd::SyncKeymap {
+                    led_key_pattern,
+                    led_ambient_pattern,
+                    ..
+                } => synced = Some((led_key_pattern, led_ambient_pattern)),
+                DeviceCmd::SetKeyLedOverride { index, color } => {
+                    latest[index as usize] = Some(color)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(synced, Some((red, blue)));
+        assert_eq!(latest[1], Some(Some((0, 255, 60))));
+        assert_eq!(latest[0], None); // never set, never sent
+        // The global settings are untouched.
+        assert_eq!(host.config.led_key_pattern, LedPattern::Rainbow);
+
+        // Nothing changed: a second refresh sends no key overrides.
+        host.refresh_activity_led();
+        assert!(latest_key_overrides(&rx).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn agent_status_beats_the_profile_key_colour_until_idle() {
+        let mut host = state();
+        let (tx, rx) = mpsc::channel();
+        host.device_tx = Some(tx);
+        host.last_conn = Some(("0.7.0".into(), "test".into()));
+        host.active_lighting_mut().set_key_color(0, Some((150, 0, 255)));
+        host.refresh_activity_led();
+        assert_eq!(latest_key_overrides(&rx)[0], Some(Some((150, 0, 255))));
+
+        let event = |status| {
+            AppEvent::Activity(ActivityEvent {
+                session_id: "claude-code:a".into(),
+                turn_id: None,
+                status,
+                begins_turn: true,
+            })
+        };
+        host.handle_event(event(ActivityStatus::Working));
+        let during = latest_key_overrides(&rx)[0];
+        assert!(matches!(during, Some(Some(c)) if c != (150, 0, 255)));
+
+        host.handle_event(event(ActivityStatus::Idle));
+        assert_eq!(latest_key_overrides(&rx)[0], Some(Some((150, 0, 255))));
+    }
+
+    #[test]
+    fn claude_status_animates_and_shows_the_most_urgent_session() {
+        let mut host = state();
+        let colors = host.config.activity_status_colors;
+        for (id, status) in [
+            ("claude-code:a", ActivityStatus::Working),
+            ("claude-code:b", ActivityStatus::Attention),
+        ] {
+            host.handle_event(AppEvent::Activity(ActivityEvent {
+                session_id: id.into(),
+                turn_id: None,
+                status,
+                begins_turn: true,
+            }));
+        }
+        let black = LedPattern::Solid { r: 0, g: 0, b: 0 };
+        host.activity_led_frame = 0;
+        assert_eq!(host.agent_led_color(0), Some(colors.attention));
+        host.activity_led_frame = 1;
+        assert_eq!(host.agent_led_color(0), Some(black));
+
+        host.handle_event(AppEvent::Activity(ActivityEvent {
+            session_id: "claude-code:b".into(),
+            turn_id: None,
+            status: ActivityStatus::Idle,
+            begins_turn: false,
+        }));
+        host.activity_led_frame = 0;
+        let bright = host.agent_led_color(0);
+        host.activity_led_frame = 4;
+        let dim = host.agent_led_color(0);
+        assert_eq!(bright, Some(colors.working));
+        assert_ne!(dim, bright);
+        assert_ne!(dim, Some(black));
     }
 
     #[test]

@@ -40,6 +40,7 @@ use crate::config::{
 };
 use crate::dfuse;
 use crate::events;
+use crate::stock;
 
 pub const VID: u16 = 0x1209;
 pub const PID: u16 = 0x0001;
@@ -184,6 +185,17 @@ pub enum DeviceMsg {
     SyncDone {
         ok: bool,
         detail: String,
+    },
+    /// A stock-firmware pad (stock.rs) has no keymap of its own: each input
+    /// is reported by slot and the host runs that slot's binding itself.
+    HostInput {
+        slot: usize,
+        pressed: bool,
+    },
+    /// A stock-firmware pad's battery, read from `device.status`.
+    Battery {
+        percent: u8,
+        charging: bool,
     },
 }
 
@@ -378,6 +390,19 @@ fn wait_for_device(
         if let Some((path, serial)) = find_raw(api) {
             if let Ok(dev) = api.open_path(&path) {
                 return Some((dev, serial));
+            }
+        }
+        // No OpenMicro firmware: fall back to a Codex Micro on its stock
+        // firmware, served in place until it is unplugged.
+        if let Some((path, serial)) = stock::find(api) {
+            if let Some(dev) = stock::open(api, &path) {
+                let alive = stock::serve(api, rx, &dev, &path, serial);
+                drop(dev);
+                events::post(DeviceMsg::Disconnected);
+                if !alive {
+                    return None;
+                }
+                continue;
             }
         }
         announce_bootloader(api, &mut announcer);

@@ -154,6 +154,12 @@ pub enum Action {
         op: MediaOp,
     },
     AppSettings, // open this app's settings sheet (the SETUP key default)
+    /// Step through the macOS app switcher, holding Cmd until the input rests.
+    AppSwitch {
+        reverse: bool,
+    },
+    /// Do nothing, even where the default profile binds this input.
+    Disabled,
 }
 
 /// The user-facing meaning of a key or touch-pad tap.
@@ -286,8 +292,77 @@ pub struct Profile {
     /// the device is running with the Codex Micro identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codex_overrides: Vec<usize>,
+    /// This profile's own lighting; None follows the global LED settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lighting: Option<ProfileLighting>,
+    /// App bundle paths (e.g. `/Applications/Zoom.app`) that switch to this
+    /// profile when they come to the front.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<String>,
+    /// The profile used when the frontmost app has no profile of its own.
+    /// `sanitize` keeps exactly one per mode.
+    #[serde(default)]
+    pub is_default: bool,
+    /// Hold-key layers: while `trigger` is held, other controls run the
+    /// layer's bindings instead (stock pads, where the Mac runs the keymap).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<HoldLayer>,
+}
+
+/// The alternate bindings used while one key is held.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HoldLayer {
+    /// The key slot (0..KEY_SLOTS) that activates the layer.
+    pub trigger: usize,
+    /// One input per slot; unbound inputs use the profile's normal binding.
+    pub inputs: Vec<InputConfig>,
+}
+
+impl HoldLayer {
+    pub fn new(trigger: usize) -> Self {
+        HoldLayer {
+            trigger,
+            inputs: (0..SLOT_COUNT).map(|_| unbound_input()).collect(),
+        }
+    }
+}
+
+/// Lighting carried by a profile, applied whenever it becomes active.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ProfileLighting {
+    /// Per-key backlight (on a stock Codex Micro: the seven command keys).
+    pub key_pattern: LedPattern,
+    pub ambient_pattern: LedPattern,
+    /// Colour for individual physical keys (index = key slot); None follows
+    /// key_pattern.
+    #[serde(default)]
+    pub key_colors: Vec<Option<(u8, u8, u8)>>,
+}
+
+impl ProfileLighting {
+    pub fn key_color(&self, index: usize) -> Option<(u8, u8, u8)> {
+        self.key_colors.get(index).copied().flatten()
+    }
+
+    pub fn set_key_color(&mut self, index: usize, color: Option<(u8, u8, u8)>) {
+        if self.key_colors.len() <= index {
+            self.key_colors.resize(index + 1, None);
+        }
+        self.key_colors[index] = color;
+        while self.key_colors.last() == Some(&None) {
+            self.key_colors.pop();
+        }
+    }
 }
 // invariant: inputs.len() == SLOT_COUNT, index = slot index
+
+impl InputConfig {
+    /// Nothing bound: in a non-default profile this input follows the
+    /// default profile.
+    pub fn is_unbound(&self) -> bool {
+        self.emitted.kind == SlotKind::None && self.action == Action::None
+    }
+}
 
 impl Profile {
     /// The emitted-code array for device sync, indexed by slot. Slots beyond
@@ -315,15 +390,17 @@ pub enum RotatorRotationPreset {
     Tracks,
     VerticalArrows,
     HorizontalArrows,
+    AppSwitcher,
 }
 
 impl RotatorRotationPreset {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Volume,
         Self::Brightness,
         Self::Tracks,
         Self::VerticalArrows,
         Self::HorizontalArrows,
+        Self::AppSwitcher,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -333,6 +410,7 @@ impl RotatorRotationPreset {
             Self::Tracks => "Track selection",
             Self::VerticalArrows => "Arrow keys · up / down",
             Self::HorizontalArrows => "Arrow keys · left / right",
+            Self::AppSwitcher => "App switcher",
         }
     }
 
@@ -343,6 +421,7 @@ impl RotatorRotationPreset {
             Self::Tracks => "Clockwise next · counter-clockwise previous",
             Self::VerticalArrows => "Clockwise down · counter-clockwise up",
             Self::HorizontalArrows => "Clockwise right · counter-clockwise left",
+            Self::AppSwitcher => "Clockwise next app · counter-clockwise previous",
         }
     }
 
@@ -408,6 +487,30 @@ impl RotatorRotationPreset {
                     code: 0x50,
                 },
             ),
+            Self::AppSwitcher => (
+                Slot {
+                    kind: SlotKind::Keyboard,
+                    mods: 0x08,
+                    code: 0x2B,
+                },
+                Slot {
+                    kind: SlotKind::Keyboard,
+                    mods: 0x0A,
+                    code: 0x2B,
+                },
+            ),
+        }
+    }
+
+    /// The host action each direction runs; presets the pad emits directly
+    /// have none.
+    fn actions(self) -> (Action, Action) {
+        match self {
+            Self::AppSwitcher => (
+                Action::AppSwitch { reverse: false },
+                Action::AppSwitch { reverse: true },
+            ),
+            _ => (Action::None, Action::None),
         }
     }
 
@@ -418,7 +521,11 @@ impl RotatorRotationPreset {
         let ccw = profile.inputs.get(SLOT_ENC_CCW)?;
         Self::ALL.into_iter().find(|preset| {
             let (cw_slot, ccw_slot) = preset.slots();
-            is_direct_slot(cw, cw_slot) && is_direct_slot(ccw, ccw_slot)
+            let (cw_action, ccw_action) = preset.actions();
+            cw.emitted == cw_slot
+                && cw.action == cw_action
+                && ccw.emitted == ccw_slot
+                && ccw.action == ccw_action
         })
     }
 
@@ -449,9 +556,20 @@ impl RotatorRotationPreset {
                 keyboard_input("Right", "arrow-right", 0, 0x4F),
                 keyboard_input("Left", "arrow-left", 0, 0x50),
             ),
+            Self::AppSwitcher => (
+                keyboard_input("Next app", "app-window", 0x08, 0x2B),
+                keyboard_input("Prev app", "app-window", 0x0A, 0x2B),
+            ),
         };
-        profile.inputs[SLOT_ENC_CW] = cw;
-        profile.inputs[SLOT_ENC_CCW] = ccw;
+        let (cw_action, ccw_action) = self.actions();
+        profile.inputs[SLOT_ENC_CW] = InputConfig {
+            action: cw_action,
+            ..cw
+        };
+        profile.inputs[SLOT_ENC_CCW] = InputConfig {
+            action: ccw_action,
+            ..ccw
+        };
     }
 }
 
@@ -760,18 +878,6 @@ impl ActivityStatusColors {
     }
 }
 
-/// UI language: follow the OS or pin one of the supported languages.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LanguageSetting {
-    #[default]
-    Auto,
-    En,
-    ZhHans,
-    ZhHant,
-    Ja,
-}
-
 /// App appearance: follow the operating system or pin a palette explicitly.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "snake_case")]
@@ -800,8 +906,6 @@ pub struct AppConfig {
     #[serde(default = "default_led_brightness")]
     pub led_brightness: u8,
     #[serde(default)]
-    pub language: LanguageSetting,
-    #[serde(default)]
     pub theme: ThemeSetting,
     /// Idle pattern of the per-key backlight (device-level, like brightness).
     #[serde(default)]
@@ -813,6 +917,10 @@ pub struct AppConfig {
     /// configs written by the original Codex-only integration compatible.
     #[serde(default, alias = "codex_status_colors")]
     pub activity_status_colors: ActivityStatusColors,
+    /// Follow the frontmost app: switch to the profile linked to it, else
+    /// the default profile.
+    #[serde(default = "default_true")]
+    pub auto_switch: bool,
 }
 
 impl Default for AppConfig {
@@ -826,11 +934,11 @@ impl Default for AppConfig {
             show_menubar: true,
             show_dock: true,
             led_brightness: DEFAULT_LED_BRIGHTNESS,
-            language: LanguageSetting::Auto,
             theme: ThemeSetting::System,
             led_key_pattern: LedPattern::Rainbow,
             led_ambient_pattern: LedPattern::Rainbow,
             activity_status_colors: ActivityStatusColors::default(),
+            auto_switch: true,
         }
     }
 }
@@ -867,7 +975,7 @@ fn consumer_input(label: &str, icon: &str, code: u16) -> InputConfig {
     }
 }
 
-fn unbound_input() -> InputConfig {
+pub fn unbound_input() -> InputConfig {
     InputConfig {
         label: String::new(),
         icon: String::new(),
@@ -928,6 +1036,10 @@ pub fn default_codex_profile() -> Profile {
         inputs,
         analog: AnalogTuning::default(),
         codex_overrides: Vec::new(),
+        lighting: None,
+        apps: Vec::new(),
+        is_default: false,
+        layers: Vec::new(),
     }
 }
 
@@ -1038,6 +1150,10 @@ pub fn empty_profile() -> Profile {
         inputs: (0..SLOT_COUNT).map(|_| unbound_input()).collect(),
         analog: AnalogTuning::default(),
         codex_overrides: Vec::new(),
+        lighting: None,
+        apps: Vec::new(),
+        is_default: false,
+        layers: Vec::new(),
     }
 }
 
@@ -1138,6 +1254,10 @@ fn stock_keycap_profile(name: &str, keys: &[TemplateKey; KEY_SLOTS]) -> Profile 
         inputs,
         analog: AnalogTuning::default(),
         codex_overrides: Vec::new(),
+        lighting: None,
+        apps: Vec::new(),
+        is_default: false,
+        layers: Vec::new(),
     }
 }
 
@@ -1227,6 +1347,30 @@ fn sanitize(cfg: &mut AppConfig) {
             };
             if input.behavior.is_none() {
                 input.behavior = infer_legacy_behavior(input);
+            }
+        }
+    }
+    for profile in &mut cfg.profiles {
+        let mut triggers = Vec::new();
+        profile.layers.retain(|layer| {
+            let keep = layer.trigger < KEY_SLOTS && !triggers.contains(&layer.trigger);
+            triggers.push(layer.trigger);
+            keep
+        });
+        for layer in &mut profile.layers {
+            layer.inputs.truncate(SLOT_COUNT);
+            layer.inputs.resize_with(SLOT_COUNT, unbound_input);
+        }
+    }
+    for mode in [ProfileMode::OpenMicro, ProfileMode::CodexMicro] {
+        let mut seen = false;
+        for profile in cfg.profiles.iter_mut().filter(|p| p.mode == mode) {
+            profile.is_default &= !seen;
+            seen |= profile.is_default;
+        }
+        if !seen {
+            if let Some(first) = cfg.profiles.iter_mut().find(|p| p.mode == mode) {
+                first.is_default = true;
             }
         }
     }
@@ -1335,11 +1479,11 @@ fn migrate_legacy(legacy: LegacyConfig) -> AppConfig {
         show_menubar: true,
         show_dock: true,
         led_brightness: DEFAULT_LED_BRIGHTNESS,
-        language: LanguageSetting::Auto,
         theme: ThemeSetting::System,
         led_key_pattern: LedPattern::Rainbow,
         led_ambient_pattern: LedPattern::Rainbow,
         activity_status_colors: ActivityStatusColors::default(),
+        auto_switch: true,
     }
 }
 
@@ -1490,6 +1634,25 @@ pub fn factory_reset(cfg: &mut AppConfig) {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn key_colours_trim_trailing_defaults() {
+        let mut lighting = ProfileLighting::default();
+        lighting.set_key_color(4, Some((1, 2, 3)));
+        assert_eq!(lighting.key_colors.len(), 5);
+        assert_eq!(lighting.key_color(4), Some((1, 2, 3)));
+        assert_eq!(lighting.key_color(12), None);
+        lighting.set_key_color(4, None);
+        assert!(lighting.key_colors.is_empty());
+    }
+
+    #[test]
+    fn profiles_without_lighting_still_load() {
+        let json = serde_json::to_value(empty_profile()).expect("serialize");
+        assert!(json.get("lighting").is_none());
+        let back: Profile = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.lighting, None);
+    }
     #[test]
     fn empty_template_binds_nothing() {
         let p = ProfileTemplate::Empty.profile(&[]);
@@ -1847,6 +2010,16 @@ mod tests {
             Some(RotatorPressPreset::LockScreen)
         );
 
+        RotatorRotationPreset::AppSwitcher.apply_to(&mut profile);
+        assert_eq!(
+            RotatorRotationPreset::infer(&profile),
+            Some(RotatorRotationPreset::AppSwitcher)
+        );
+        assert_eq!(
+            profile.inputs[SLOT_ENC_CCW].action,
+            Action::AppSwitch { reverse: true }
+        );
+
         RotatorRotationPreset::VerticalArrows.apply_to(&mut profile);
         profile.inputs[SLOT_ENC_CW].action = Action::Media { op: MediaOp::Mute };
         assert_eq!(
@@ -2097,6 +2270,30 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_keeps_exactly_one_default_profile_per_mode() {
+        let mut cfg = AppConfig::default();
+        cfg.profiles.push(empty_profile());
+        cfg.profiles.push(Profile { is_default: true, ..empty_profile() });
+        cfg.profiles.push(Profile { is_default: true, ..empty_profile() });
+        sanitize(&mut cfg);
+        let defaults: Vec<usize> = cfg
+            .profiles
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.is_default.then_some(i))
+            .collect();
+        assert_eq!(defaults, [2]);
+
+        let mut json = serde_json::to_value(AppConfig::default()).expect("serialize");
+        let profile = json["profiles"][0].as_object_mut().unwrap();
+        profile.remove("is_default");
+        json.as_object_mut().unwrap().remove("auto_switch");
+        let mut old: AppConfig = serde_json::from_value(json).expect("old config loads");
+        sanitize(&mut old);
+        assert!(old.profiles[0].is_default && old.auto_switch);
+    }
+
+    #[test]
     fn sanitize_clamps_and_pads() {
         let mut cfg = AppConfig {
             active_profile: 7,
@@ -2108,16 +2305,20 @@ mod tests {
                 inputs: vec![],
                 analog: AnalogTuning::default(),
                 codex_overrides: Vec::new(),
+                lighting: None,
+                apps: Vec::new(),
+                is_default: false,
+                layers: Vec::new(),
             }],
             launch_at_login: false,
             show_menubar: false,
             show_dock: false,
             led_brightness: DEFAULT_LED_BRIGHTNESS,
-            language: LanguageSetting::Auto,
             theme: ThemeSetting::System,
             led_key_pattern: LedPattern::Rainbow,
             led_ambient_pattern: LedPattern::Rainbow,
             activity_status_colors: ActivityStatusColors::default(),
+            auto_switch: true,
         };
         sanitize(&mut cfg);
         assert_eq!(cfg.active_profile, 0);

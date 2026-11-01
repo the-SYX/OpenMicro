@@ -441,6 +441,9 @@ pub fn run_cli_if_requested() -> bool {
         Some("claude-hook") | Some("claude-code-hook") => {
             std::process::exit(run_agent_hook(Some("claude-code")));
         }
+        Some("probe-rpc") => {
+            std::process::exit(crate::stock::run_probe(args.next().as_deref()));
+        }
         Some("status") => {
             let status = args.next();
             std::process::exit(run_manual_status(status.as_deref(), args.next()));

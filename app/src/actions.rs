@@ -13,6 +13,8 @@
 //! permission story (`accessibility_trusted` / `needs_permission` /
 //! `open_permission_settings`) lives next to the code it gates.
 
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -66,6 +68,8 @@ fn run_blocking(action: &Action) {
         Action::Open { target } => open_target(target),
         Action::Media { op } => media_op(*op),
         Action::AppSettings => events::post(OpenAppSettings),
+        Action::AppSwitch { reverse } => app_switch(*reverse),
+        Action::Disabled => {}
     }
 }
 
@@ -179,6 +183,82 @@ fn synthesize_keystroke(mods: u8, usage: u16) {
     }
 }
 
+/// The live app-switcher session: each step is sent here while Cmd is held.
+static APP_SWITCH: Mutex<Option<Sender<bool>>> = Mutex::new(None);
+
+/// How long Cmd stays held after the last step, so the switcher stays open
+/// between knob detents and commits once the knob rests.
+const APP_SWITCH_HOLD: Duration = Duration::from_millis(800);
+
+/// One step of the Cmd-Tab switcher. The first step opens a session thread
+/// that holds Cmd; later steps join it, so the switcher walks through every
+/// app instead of flipping between the last two.
+fn app_switch(reverse: bool) {
+    let Ok(mut session) = APP_SWITCH.lock() else {
+        return;
+    };
+    if let Some(tx) = session.as_ref() {
+        if tx.send(reverse).is_ok() {
+            return;
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let _ = tx.send(reverse);
+    *session = Some(tx);
+    drop(session);
+    thread::spawn(move || {
+        let Some(mut enigo) = new_enigo() else {
+            if let Ok(mut session) = APP_SWITCH.lock() {
+                *session = None;
+            }
+            return;
+        };
+        let tab = |enigo: &mut Enigo, reverse: bool| {
+            if reverse {
+                let _ = enigo.key(Key::Shift, Direction::Press);
+            }
+            if let Err(e) = enigo.key(Key::Tab, Direction::Click) {
+                eprintln!("actions: app switcher step failed: {e}");
+            }
+            if reverse {
+                let _ = enigo.key(Key::Shift, Direction::Release);
+            }
+        };
+        if let Err(e) = enigo.key(Key::Meta, Direction::Press) {
+            eprintln!("actions: app switcher Cmd press failed: {e}");
+        }
+        loop {
+            match rx.recv_timeout(APP_SWITCH_HOLD) {
+                Ok(reverse) => tab(&mut enigo, reverse),
+                Err(RecvTimeoutError::Timeout) => {
+                    // Close the session under the lock so no step is lost
+                    // between the timeout and the release, then run any
+                    // that arrived meanwhile.
+                    if let Ok(mut session) = APP_SWITCH.lock() {
+                        *session = None;
+                    }
+                    while let Ok(reverse) = rx.try_recv() {
+                        tab(&mut enigo, reverse);
+                    }
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = enigo.key(Key::Meta, Direction::Release);
+    });
+}
+
+/// Pick the app highlighted in an open switcher now instead of waiting for
+/// the knob to rest. Returns false when no switcher is open.
+pub fn commit_app_switch() -> bool {
+    let Ok(mut session) = APP_SWITCH.lock() else {
+        return false;
+    };
+    // Dropping the sender ends the session thread, which releases Cmd.
+    session.take().is_some()
+}
+
 /// Tap one media key.
 fn media_op(op: MediaOp) {
     let Some(key) = media_key(op) else {
@@ -230,6 +310,14 @@ fn media_key(op: MediaOp) -> Option<Key> {
 /// their enigo variants. Unmapped usages return None and the keystroke is
 /// skipped (never guessed).
 fn hid_to_enigo(usage: u16) -> Option<Key> {
+    // On macOS, enigo resolves `Key::Unicode` through the keyboard layout
+    // (TSM), which current macOS only allows on the main queue; from the
+    // action worker thread it aborts the app. Raw virtual keycodes skip that
+    // lookup, and HID usages are positional anyway.
+    #[cfg(target_os = "macos")]
+    if let Some(code) = mac_virtual_keycode(usage) {
+        return Some(Key::Other(code));
+    }
     Some(match usage {
         // a..z (0x04..=0x1D), 1..9 (0x1E..=0x26), 0 (0x27)
         0x04..=0x1D => Key::Unicode((b'a' + (usage - 0x04) as u8) as char),
@@ -289,6 +377,35 @@ fn hid_to_enigo(usage: u16) -> Option<Key> {
     })
 }
 
+/// macOS ANSI virtual keycodes (`kVK_ANSI_*`) for the HID usages that enigo
+/// would otherwise resolve through the keyboard layout.
+#[cfg(target_os = "macos")]
+fn mac_virtual_keycode(usage: u16) -> Option<u32> {
+    // a..z in HID order
+    const LETTERS: [u32; 26] = [
+        0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E, 0x2D,
+        0x1F, 0x23, 0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07, 0x10, 0x06,
+    ];
+    // 1..9, 0 in HID order
+    const DIGITS: [u32; 10] = [0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19, 0x1D];
+    Some(match usage {
+        0x04..=0x1D => LETTERS[(usage - 0x04) as usize],
+        0x1E..=0x27 => DIGITS[(usage - 0x1E) as usize],
+        0x2D => 0x1B, // -
+        0x2E => 0x18, // =
+        0x2F => 0x21, // [
+        0x30 => 0x1E, // ]
+        0x31 => 0x2A, // \
+        0x33 => 0x29, // ;
+        0x34 => 0x27, // '
+        0x35 => 0x32, // `
+        0x36 => 0x2B, // ,
+        0x37 => 0x2F, // .
+        0x38 => 0x2C, // /
+        _ => return None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Permissions (macOS Accessibility)
 // ---------------------------------------------------------------------------
@@ -332,7 +449,7 @@ pub fn open_permission_settings() {
 /// through the OS launcher or stay inside the app.
 pub fn needs_permission(action: &Action) -> bool {
     match action {
-        Action::Keystroke { .. } | Action::Media { .. } => true,
+        Action::Keystroke { .. } | Action::Media { .. } | Action::AppSwitch { .. } => true,
         Action::Macro { steps } => steps.iter().any(|e| {
             e.enabled
                 && matches!(
@@ -340,7 +457,11 @@ pub fn needs_permission(action: &Action) -> bool {
                     MacroStep::Keystroke { .. } | MacroStep::Media { .. }
                 )
         }),
-        Action::None | Action::Run { .. } | Action::Open { .. } | Action::AppSettings => false,
+        Action::None
+        | Action::Run { .. }
+        | Action::Open { .. }
+        | Action::AppSettings
+        | Action::Disabled => false,
     }
 }
 
@@ -367,6 +488,9 @@ pub fn describe(action: &Action) -> String {
         Action::Open { target } => format!("Open · {}", short_target(target)),
         Action::Media { op } => media_label(*op).to_string(),
         Action::AppSettings => "App settings".to_string(),
+        Action::AppSwitch { reverse: false } => "Next app".to_string(),
+        Action::AppSwitch { reverse: true } => "Previous app".to_string(),
+        Action::Disabled => "Do nothing".to_string(),
     }
 }
 
@@ -423,8 +547,14 @@ mod tests {
 
     #[test]
     fn hid_map_covers_the_basics() {
-        assert_eq!(hid_to_enigo(0x04), Some(Key::Unicode('a')));
-        assert_eq!(hid_to_enigo(0x27), Some(Key::Unicode('0')));
+        if cfg!(target_os = "macos") {
+            assert_eq!(hid_to_enigo(0x04), Some(Key::Other(0x00))); // kVK_ANSI_A
+            assert_eq!(hid_to_enigo(0x27), Some(Key::Other(0x1D))); // kVK_ANSI_0
+            assert_eq!(hid_to_enigo(0x38), Some(Key::Other(0x2C))); // kVK_ANSI_Slash
+        } else {
+            assert_eq!(hid_to_enigo(0x04), Some(Key::Unicode('a')));
+            assert_eq!(hid_to_enigo(0x27), Some(Key::Unicode('0')));
+        }
         assert_eq!(hid_to_enigo(0x28), Some(Key::Return));
         assert_eq!(hid_to_enigo(0x3A), Some(Key::F1));
         assert_eq!(hid_to_enigo(0x6F), Some(Key::F20));

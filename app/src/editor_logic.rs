@@ -418,8 +418,8 @@ impl ActionKind {
 
 pub const fn classify_action(action: &Action) -> ActionKind {
     match action {
-        Action::None => ActionKind::None,
-        Action::Keystroke { .. } => ActionKind::Keystroke,
+        Action::None | Action::Disabled => ActionKind::None,
+        Action::Keystroke { .. } | Action::AppSwitch { .. } => ActionKind::Keystroke,
         Action::Macro { .. } => ActionKind::Macro,
         Action::Run { .. } => ActionKind::Run,
         Action::Open { .. } => ActionKind::Open,
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn rotator_joystick_and_subslot_catalogs_wrap() {
         let mut profile = default_codex_profile();
-        RotatorRotationPreset::HorizontalArrows.apply_to(&mut profile);
+        RotatorRotationPreset::AppSwitcher.apply_to(&mut profile);
         assert_eq!(
             cycle_rotator_rotation(&mut profile, CycleDirection::Next),
             RotatorRotationPreset::Volume

@@ -18,7 +18,7 @@ use gpui::{
     Window, WindowAppearance, WindowBounds, WindowOptions,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Root, Selectable, StyledExt, TitleBar};
@@ -30,7 +30,7 @@ use crate::agent_integrations::{
 use crate::behaviors::{self, InstalledApp};
 use crate::boot;
 use crate::config::{
-    self, Action, ControlBehavior, InputConfig, JoystickMode, LanguageSetting, LedPattern,
+    self, Action, ControlBehavior, InputConfig, JoystickMode, LedPattern,
     MacroStep, MacroStepEntry, MediaOp, ProfileTemplate, RotatorPressPreset, RotatorRotationPreset,
     SlotKind, ThemeSetting, KEY_SLOTS, SLOT_ENC_CCW, SLOT_ENC_CW, SLOT_ENC_PRESS, SLOT_JOY_DOWN,
     SLOT_JOY_LEFT, SLOT_JOY_PRESS, SLOT_JOY_RIGHT, SLOT_JOY_UP, SLOT_TOUCH_SWIPE_L,
@@ -41,8 +41,9 @@ use crate::dfuse;
 use crate::editor_logic::{self, CycleDirection, SimpleBehaviorKind};
 use crate::events;
 use crate::gpui_controls::{self as controls, CellVisual};
-use crate::host_state::{HostEffect, HostState};
-use crate::i18n::{self, tr};
+use crate::host_state::{HostEffect, HostState, InputSource};
+use crate::frontmost;
+use crate::i18n::tr;
 use crate::keycodes;
 use crate::macos_updater::{MacOsUpdater, UpdateCheck};
 use crate::pixel::{self, BadgeTone};
@@ -306,16 +307,6 @@ impl PickerIcon {
     }
 }
 
-fn resolve_language(setting: LanguageSetting) -> i18n::Lang {
-    match setting {
-        LanguageSetting::Auto => i18n::detect(),
-        LanguageSetting::En => i18n::Lang::En,
-        LanguageSetting::ZhHans => i18n::Lang::ZhHans,
-        LanguageSetting::ZhHant => i18n::Lang::ZhHant,
-        LanguageSetting::Ja => i18n::Lang::Ja,
-    }
-}
-
 fn resolve_theme(setting: ThemeSetting, appearance: WindowAppearance) -> pixel::ColorScheme {
     match setting {
         ThemeSetting::Light => pixel::ColorScheme::Light,
@@ -424,6 +415,8 @@ fn action_kind_label(action: &Action) -> &'static str {
         Action::Open { .. } => tr("act_open"),
         Action::Media { .. } => tr("act_media"),
         Action::AppSettings => tr("act_app_settings"),
+        Action::AppSwitch { .. } => "App switcher",
+        Action::Disabled => tr("act_disabled"),
     }
 }
 
@@ -790,6 +783,67 @@ fn profile_delete_item(
     })
 }
 
+/// A profile menu entry that runs `on_click` on the view.
+fn profile_action_item(
+    label: String,
+    view: &Entity<OpenMicro>,
+    on_click: impl Fn(&mut OpenMicro, &mut Window, &mut Context<OpenMicro>) + 'static,
+) -> PopupMenuItem {
+    let view = view.clone();
+    PopupMenuItem::element(move |_, _| div().cursor_pointer().child(label.clone())).on_click(
+        move |_, window, cx| {
+            view.update(cx, |this, cx| on_click(this, window, cx));
+        },
+    )
+}
+
+/// Default / linked-app entries of the profile menu.
+fn profile_app_items(
+    menu: PopupMenu,
+    is_default: bool,
+    linked: &[String],
+    view: &Entity<OpenMicro>,
+) -> PopupMenu {
+    let mut menu = menu.separator();
+    if !is_default {
+        menu = menu.item(profile_action_item(tr("make_default_profile").into(), view, |this, _, cx| {
+            let index = this.host.config.active_profile;
+            this.host.set_default_profile(index);
+            cx.notify();
+        }));
+    }
+    menu = menu.item(profile_action_item(tr("link_app").into(), view, |this, window, cx| {
+        this.open_app_picker(true, window, cx);
+    }));
+    for path in linked {
+        let path = path.clone();
+        menu = menu.item(profile_action_item(
+            format!("{} {}", tr("unlink_app"), app_display_name(&path)),
+            view,
+            move |this, _, cx| {
+                this.host.unlink_app(&path);
+                cx.notify();
+            },
+        ));
+    }
+    menu
+}
+
+/// Hand a builder to a function mid-chain.
+trait Pipe: Sized {
+    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
+        f(self)
+    }
+}
+
+impl<T> Pipe for T {}
+
+/// "Zoom" for `/Applications/Zoom.app`.
+fn app_display_name(path: &str) -> String {
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
+    name.strip_suffix(".app").unwrap_or(name).to_string()
+}
+
 /// The face of a header chrome button, without its own hitbox occlusion.
 /// Use `chrome_icon_button` unless something around the face occludes for
 /// it (see `ChromeMenuButton`).
@@ -902,6 +956,9 @@ pub struct OpenMicro {
     macro_draft: Vec<MacroStepEntry>,
     macro_edit_index: Option<usize>,
     installed_apps: Vec<InstalledApp>,
+    /// The Applications sheet links an app to the active profile instead of
+    /// choosing a key's launch target.
+    app_picker_for_profile: bool,
     agent_integrations: Vec<IntegrationReport>,
     agent_integration_feedback: Option<(String, BadgeTone)>,
     discord_open_error: Option<String>,
@@ -928,7 +985,6 @@ impl OpenMicro {
         let mut host = HostState::new();
         set_dock_icon_visible(host.config.show_dock);
         pixel::install_theme(resolve_theme(host.config.theme, window.appearance()), cx);
-        i18n::set_lang(resolve_language(host.config.language));
         let _ = host.select_slot(0);
 
         if let Err(error) = apply_launch_at_login(host.config.launch_at_login) {
@@ -962,6 +1018,7 @@ impl OpenMicro {
             macro_draft: Vec::new(),
             macro_edit_index: None,
             installed_apps: behaviors::installed_apps(),
+            app_picker_for_profile: false,
             agent_integrations: Vec::new(),
             agent_integration_feedback: None,
             discord_open_error: None,
@@ -1110,8 +1167,9 @@ impl OpenMicro {
         this.start_event_loop(cx);
         this.start_release_timer(cx);
         this.start_agent_led_timer(cx);
+        this.start_frontmost_timer(window, cx);
         cx.on_app_quit(|this, _| {
-            let _ = config::save(&this.host.config);
+            let _ = config::save(&this.host.stored_config());
             async {}
         })
         .detach();
@@ -1140,6 +1198,54 @@ impl OpenMicro {
                 break;
             }
             let _ = weak.update(cx, |_, _| {});
+        })
+        .detach();
+    }
+
+    fn toggle_layer(&mut self, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.host.toggle_layer(slot);
+        self.sync_inputs(window, cx);
+        cx.notify();
+    }
+
+    fn cycle_input_source(&mut self, cell: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.host.cycle_input_source(slots_for_cell(cell));
+        self.commit(true, cx);
+        self.sync_inputs(window, cx);
+        cx.notify();
+    }
+
+    fn open_app_picker(&mut self, for_profile: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.app_picker_for_profile = for_profile;
+        self.icon_query.clear();
+        self.icon_page = 0;
+        self.sheet = Sheet::Applications;
+        self.sync_inputs(window, cx);
+        self.search_input.update(cx, |input, cx| {
+            input.set_placeholder(tr("app_search_placeholder"), window, cx)
+        });
+        cx.notify();
+    }
+
+    /// Poll the frontmost app and follow it with the linked profile.
+    fn start_frontmost_timer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |weak, cx| loop {
+            Timer::after(Duration::from_millis(500)).await;
+            if weak.upgrade().is_none() {
+                break;
+            }
+            let _ = weak.update_in(cx, |this, window, cx| {
+                // Leave open sheets and renames alone; the next poll retries.
+                if this.sheet != Sheet::None || this.editing_profile_name {
+                    return;
+                }
+                let front = frontmost::frontmost_app_path();
+                if this.host.on_frontmost_app(front.as_deref()) {
+                    this.recording = RecordTarget::None;
+                    this.sync_inputs(window, cx);
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -1247,7 +1353,7 @@ impl OpenMicro {
                     show_main_window(cx);
                 }
                 HostEffect::Quit => {
-                    let _ = config::save(&self.host.config);
+                    let _ = config::save(&self.host.stored_config());
                     cx.quit();
                 }
                 HostEffect::ReleaseCellAfter { cell, delay } => {
@@ -1716,8 +1822,8 @@ impl OpenMicro {
             return;
         };
         let current = match self.host.active_profile().inputs[slot].action {
-            Action::None => 0,
-            Action::Keystroke { .. } => 1,
+            Action::None | Action::Disabled => 0,
+            Action::Keystroke { .. } | Action::AppSwitch { .. } => 1,
             Action::Macro { .. } => 2,
             Action::Run { .. } => 3,
             Action::Open { .. } => 4,
@@ -1769,39 +1875,6 @@ impl OpenMicro {
         self.commit(false, cx);
     }
 
-    fn cycle_language(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        const LANGUAGES: [LanguageSetting; 5] = [
-            LanguageSetting::Auto,
-            LanguageSetting::En,
-            LanguageSetting::ZhHans,
-            LanguageSetting::ZhHant,
-            LanguageSetting::Ja,
-        ];
-        let current = LANGUAGES
-            .iter()
-            .position(|item| *item == self.host.config.language)
-            .unwrap_or(0);
-        self.host.config.language = LANGUAGES[wrapped_index(current, LANGUAGES.len(), delta)];
-        i18n::set_lang(resolve_language(self.host.config.language));
-        self.agent_integration_feedback = None;
-        self.commit(false, cx);
-        self.label_input.update(cx, |input, cx| {
-            input.set_placeholder(tr("keycap_label_placeholder"), window, cx)
-        });
-        self.profile_input.update(cx, |input, cx| {
-            input.set_placeholder(tr("profile_name_placeholder"), window, cx)
-        });
-        self.command_input.update(cx, |input, cx| {
-            input.set_placeholder(tr("shell_command_placeholder"), window, cx)
-        });
-        self.target_input.update(cx, |input, cx| {
-            input.set_placeholder(tr("open_placeholder"), window, cx)
-        });
-        self.search_input.update(cx, |input, cx| {
-            input.set_placeholder(tr("icon_search_placeholder"), window, cx)
-        });
-    }
-
     fn apply_configured_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
         let scheme = resolve_theme(self.host.config.theme, window.appearance());
         if scheme != pixel::color_scheme() {
@@ -1822,16 +1895,6 @@ impl OpenMicro {
         self.host.config.theme = THEMES[wrapped_index(current, THEMES.len(), delta)];
         self.apply_configured_theme(window, cx);
         self.commit(false, cx);
-    }
-
-    fn language_label(&self) -> &'static str {
-        match self.host.config.language {
-            LanguageSetting::Auto => tr("language_auto"),
-            LanguageSetting::En => "English",
-            LanguageSetting::ZhHans => "简体中文",
-            LanguageSetting::ZhHant => "繁體中文",
-            LanguageSetting::Ja => "日本語",
-        }
     }
 
     fn theme_label(&self) -> &'static str {
@@ -1896,9 +1959,9 @@ impl OpenMicro {
     fn cycle_pattern(&mut self, key_chain: bool, delta: i32, cx: &mut Context<Self>) {
         let n = (PATTERN_PALETTE.len() + 2) as i32;
         let current = if key_chain {
-            self.host.config.led_key_pattern
+            self.host.key_pattern()
         } else {
-            self.host.config.led_ambient_pattern
+            self.host.ambient_pattern()
         };
         let index = match current {
             LedPattern::Rainbow => 0,
@@ -1918,12 +1981,64 @@ impl OpenMicro {
                 LedPattern::Solid { r, g, b }
             }
         };
+        // Lighting belongs to the profile being edited.
+        let lighting = self.host.active_lighting_mut();
         if key_chain {
-            self.host.config.led_key_pattern = pattern;
+            lighting.key_pattern = pattern;
         } else {
-            self.host.config.led_ambient_pattern = pattern;
+            lighting.ambient_pattern = pattern;
         }
         self.commit(true, cx);
+    }
+
+    /// Step the selected key's own colour: Default (follow the backlight),
+    /// then the palette.
+    fn cycle_key_color(&mut self, slot: usize, delta: i32, cx: &mut Context<Self>) {
+        let n = (PATTERN_PALETTE.len() + 1) as i32;
+        let current = self
+            .host
+            .active_profile()
+            .lighting
+            .as_ref()
+            .and_then(|l| l.key_color(slot));
+        let index = current
+            .and_then(|c| {
+                PATTERN_PALETTE
+                    .iter()
+                    .position(|(_, r, g, b)| (*r, *g, *b) == c)
+            })
+            .map_or(0, |i| i as i32 + 1);
+        let next = (index + delta).rem_euclid(n);
+        let color = (next > 0).then(|| {
+            let (_, r, g, b) = PATTERN_PALETTE[(next - 1) as usize];
+            (r, g, b)
+        });
+        self.host.active_lighting_mut().set_key_color(slot, color);
+        self.commit(true, cx);
+    }
+
+    fn key_color_label(&self, slot: usize) -> String {
+        match self
+            .host
+            .active_profile()
+            .lighting
+            .as_ref()
+            .and_then(|l| l.key_color(slot))
+        {
+            None => "Default (backlight)".to_string(),
+            Some((r, g, b)) => Self::pattern_label(LedPattern::Solid { r, g, b }),
+        }
+    }
+
+    /// Keys whose LED can be coloured on its own on the connected pad. The
+    /// stock Codex Micro firmware only addresses the six agent keys.
+    fn key_color_supported(&self, slot: usize) -> bool {
+        let stock = self
+            .host
+            .last_conn
+            .as_ref()
+            .is_some_and(|(version, _)| crate::stock::is_stock_version(version));
+        slot < if stock { 6 } else { KEY_SLOTS }
     }
 
     fn cycle_status_color(&mut self, status: ActivityStatus, delta: isize, cx: &mut Context<Self>) {
@@ -2388,6 +2503,7 @@ impl OpenMicro {
         if self.host.visible_profile_indices().len() <= 1 {
             return;
         }
+        self.host.exit_layer_edit();
         let index = self.host.config.active_profile;
         self.host.config.profiles.remove(index);
         for remembered in [
@@ -2599,6 +2715,17 @@ impl OpenMicro {
         let show_profile_templates = self.host.device_mode != Some(DeviceMode::Codex);
         let can_delete_profile = self.host.visible_profile_indices().len() > 1;
         let delete_profile_label = tr("delete_active_profile");
+        let profile_is_default = self.host.default_profile_index() == Some(self.host.config.active_profile);
+        let linked_apps = self.host.active_profile().apps.clone();
+        let codex_linked_apps = linked_apps.clone();
+        let profile_tag = if profile_is_default {
+            format!("{} · {}", tr("profile"), tr("default_profile_tag"))
+        } else if !linked_apps.is_empty() {
+            let names: Vec<String> = linked_apps.iter().map(|p| app_display_name(p)).collect();
+            format!("{} · {}", tr("profile"), short_text(&names.join(", "), 28))
+        } else {
+            tr("profile").to_string()
+        };
         let view = cx.entity();
         let codex_view = view.clone();
         let (connection, connection_color) = if self.host.connected {
@@ -2697,7 +2824,7 @@ impl OpenMicro {
                     .text_size(px(9.))
                     .font_semibold()
                     .text_color(pixel::dim_text_color())
-                    .child(tr("profile")),
+                    .child(profile_tag),
             )
             .child(
                 chrome_icon_button("chevron-left")
@@ -2782,6 +2909,9 @@ impl OpenMicro {
                                 can_delete_profile,
                                 &delete_view,
                             ))
+                            .pipe(|menu| {
+                                profile_app_items(menu, profile_is_default, &linked_apps, &view)
+                            })
                         },
                     ),
                 )
@@ -2802,6 +2932,14 @@ impl OpenMicro {
                                 can_delete_profile,
                                 &delete_view,
                             ))
+                            .pipe(|menu| {
+                                profile_app_items(
+                                    menu,
+                                    profile_is_default,
+                                    &codex_linked_apps,
+                                    &codex_view,
+                                )
+                            })
                         }),
                 )
                 .into_any_element()
@@ -3067,6 +3205,7 @@ impl OpenMicro {
                 );
             } else if let Some((installed, _)) = self.host.last_conn.as_ref() {
                 let firmware_available = release::is_newer(&catalog.firmware.version, installed)
+                    && !crate::stock::is_stock_version(installed)
                     && !self.host.firmware_banner_dismissed
                     && self.host.bootloader.is_none();
                 if firmware_available {
@@ -3148,11 +3287,23 @@ impl OpenMicro {
     fn render_device_cell(&self, cell: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let slots = slots_for_cell(cell);
         let primary = slots[0];
-        let input = &self.host.active_profile().inputs[primary];
         let native_codex = self.host.device_mode == Some(DeviceMode::Codex)
             && slots
                 .iter()
                 .all(|slot| !self.host.active_profile().codex_overrides.contains(slot));
+        // Empty controls show what they inherit from the default profile.
+        let inherited = !native_codex
+            && slots.iter().all(|slot| self.host.inherited_input(*slot).is_some()
+                || self.host.active_profile().inputs[*slot].is_unbound())
+            && slots.iter().any(|slot| self.host.inherited_input(*slot).is_some());
+        let effective;
+        let shown_profile = if inherited {
+            effective = self.host.effective_profile();
+            &effective
+        } else {
+            self.host.active_profile()
+        };
+        let input = &shown_profile.inputs[primary];
         let selected = self
             .host
             .selected_slot
@@ -3180,7 +3331,9 @@ impl OpenMicro {
                 pixel::muted_text_color()
             },
         );
+        let layer_key = cell < KEY_SLOTS && self.host.editing_layer == Some(primary);
         let label = match cell {
+            0..=12 if layer_key => tr("hold_key_label").to_string(),
             0..=12 => {
                 if native_codex || input.label.trim().is_empty() {
                     format!("KEY {:02}", cell + 1)
@@ -3203,12 +3356,10 @@ impl OpenMicro {
                         actions::describe(&input.action)
                     }
                 }
-                CELL_ENCODER => RotatorRotationPreset::infer(self.host.active_profile())
+                CELL_ENCODER => RotatorRotationPreset::infer(shown_profile)
                     .map(|preset| preset.label().to_string())
                     .unwrap_or_else(|| "Custom rotation".into()),
-                CELL_JOYSTICK => JoystickMode::infer(self.host.active_profile())
-                    .label()
-                    .to_string(),
+                CELL_JOYSTICK => JoystickMode::infer(shown_profile).label().to_string(),
                 _ => {
                     if input.action == Action::None {
                         keycodes::slot_label(&input.emitted)
@@ -3217,6 +3368,13 @@ impl OpenMicro {
                     }
                 }
             }
+        };
+        let detail = if layer_key {
+            tr("hold_key_detail").to_string()
+        } else if inherited {
+            format!("↳ {detail}")
+        } else {
+            detail
         };
         controls::keycap_device_cell(
             label,
@@ -3295,6 +3453,25 @@ impl OpenMicro {
             .items_center()
             .justify_center()
             .gap(px(12.))
+            .children(self.host.editing_layer.map(|trigger| {
+                div()
+                    .w(px(440.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().child(controls::status_rail(
+                        tr("hold_layer_eyebrow"),
+                        format!("{} KEY {:02}", tr("hold_layer_editing"), trigger + 1),
+                        BadgeTone::Accent,
+                    )))
+                    .child(tiny_button(tr("done")).id("exit-layer-edit").on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.host.exit_layer_edit();
+                            this.sync_inputs(window, cx);
+                            cx.notify();
+                        },
+                    )))
+            }))
             .child(board)
     }
 
@@ -3566,14 +3743,7 @@ impl OpenMicro {
                         )
                         .id("open-app-picker")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.icon_query.clear();
-                            this.icon_page = 0;
-                            this.sheet = Sheet::Applications;
-                            this.sync_inputs(window, cx);
-                            this.search_input.update(cx, |input, cx| {
-                                input.set_placeholder(tr("app_search_placeholder"), window, cx)
-                            });
-                            cx.notify();
+                            this.open_app_picker(false, window, cx);
                         })),
                     ),
                 );
@@ -3661,6 +3831,47 @@ impl OpenMicro {
                     ("advanced-subslot", 1usize).into(),
                     cx.listener(|this, _, window, cx| this.cycle_subslot(-1, window, cx)),
                     cx.listener(|this, _, window, cx| this.cycle_subslot(1, window, cx)),
+                ),
+            ));
+        }
+
+        if slot < KEY_SLOTS && self.host.editing_layer.is_none() {
+            let has_layer = self.host.has_layer(slot);
+            editor = editor.child(inspector_field(
+                tr("hold_layer_eyebrow"),
+                tr("hold_layer_note"),
+                controls::cycle_control(
+                    if has_layer { tr("on") } else { tr("off") },
+                    ("hold-layer", 0usize).into(),
+                    ("hold-layer", 1usize).into(),
+                    cx.listener(move |this, _, window, cx| this.toggle_layer(slot, window, cx)),
+                    cx.listener(move |this, _, window, cx| this.toggle_layer(slot, window, cx)),
+                ),
+            ));
+            if has_layer {
+                editor = editor.child(
+                    tiny_button(tr("hold_layer_edit")).id("edit-layer").on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.host.enter_layer_edit(slot);
+                            this.host.selected_slot = None;
+                            this.sync_inputs(window, cx);
+                            cx.notify();
+                        },
+                    )),
+                );
+            }
+        }
+
+        if self.key_color_supported(slot) {
+            editor = editor.child(inspector_field(
+                "KEY COLOUR",
+                "This key's light in this profile",
+                controls::cycle_control(
+                    self.key_color_label(slot),
+                    ("key-color", 0usize).into(),
+                    ("key-color", 1usize).into(),
+                    cx.listener(move |this, _, _, cx| this.cycle_key_color(slot, -1, cx)),
+                    cx.listener(move |this, _, _, cx| this.cycle_key_color(slot, 1, cx)),
                 ),
             ));
         }
@@ -3917,6 +4128,20 @@ impl OpenMicro {
                     BadgeTone::Info,
                 ));
             }
+            Action::AppSwitch { .. } => {
+                editor = editor.child(controls::status_rail(
+                    "CMD+TAB",
+                    "Steps through open apps, holding Cmd until the control rests.",
+                    BadgeTone::Info,
+                ));
+            }
+            Action::Disabled => {
+                editor = editor.child(controls::status_rail(
+                    "OFF",
+                    "This control does nothing in this profile.",
+                    BadgeTone::Info,
+                ));
+            }
         }
 
         if (SLOT_JOY_UP..=SLOT_JOY_PRESS).contains(&slot) {
@@ -4086,6 +4311,25 @@ impl OpenMicro {
                 ));
         };
         let cell = cell_for_slot(slot);
+        let source = self.host.has_fallback().then(|| {
+            let slots = slots_for_cell(cell);
+            let label = match self.host.input_source(slots) {
+                InputSource::Default => tr("source_default"),
+                InputSource::Own => tr("source_own"),
+                InputSource::Disabled => tr("source_disabled"),
+            };
+            div().px(px(16.)).child(inspector_field(
+                tr("source_eyebrow"),
+                tr("source_note"),
+                controls::cycle_control(
+                    label,
+                    ("input-source", 0usize).into(),
+                    ("input-source", 1usize).into(),
+                    cx.listener(move |this, _, window, cx| this.cycle_input_source(cell, window, cx)),
+                    cx.listener(move |this, _, window, cx| this.cycle_input_source(cell, window, cx)),
+                ),
+            ))
+        });
         let body = if cell == CELL_ENCODER {
             self.render_rotator_editor(cx)
         } else if cell == CELL_JOYSTICK {
@@ -4110,6 +4354,7 @@ impl OpenMicro {
                     .py(px(8.))
                     .track_scroll(&self.inspector_scroll)
                     .overflow_y_scroll()
+                    .children(source)
                     .child(body),
             )
     }
@@ -4120,7 +4365,15 @@ impl OpenMicro {
             .host
             .last_conn
             .as_ref()
-            .map(|(version, _)| format!("{} {}", tr("installed"), version))
+            .map(|(version, _)| match self.host.battery {
+                Some((percent, charging)) => format!(
+                    "{} {} · battery {percent}%{}",
+                    tr("installed"),
+                    version,
+                    if charging { " (charging)" } else { "" }
+                ),
+                None => format!("{} {}", tr("installed"), version),
+            })
             .unwrap_or_else(|| tr("no_pad_connected").to_string());
 
         // One titled section per concern, in the order people look for
@@ -4128,17 +4381,6 @@ impl OpenMicro {
         // settings, the coding-agent features, data and permissions, and
         // the community link last.
         let app = settings_section(tr("settings_section_app"))
-            .child(inspector_field(
-                tr("language_eyebrow"),
-                tr("language_applies"),
-                controls::cycle_control(
-                    self.language_label(),
-                    ("settings-language", 0usize).into(),
-                    ("settings-language", 1usize).into(),
-                    cx.listener(|this, _, window, cx| this.cycle_language(-1, window, cx)),
-                    cx.listener(|this, _, window, cx| this.cycle_language(1, window, cx)),
-                ),
-            ))
             .child(inspector_field(
                 tr("appearance_eyebrow"),
                 tr("theme_applies"),
@@ -4180,6 +4422,14 @@ impl OpenMicro {
                     this.commit(false, cx);
                 })),
             )
+            .child(
+                controls::toggle_face(tr("auto_switch_profiles"), self.host.config.auto_switch, true)
+                    .id("toggle-auto-switch")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.host.config.auto_switch = !this.host.config.auto_switch;
+                        this.commit(false, cx);
+                    })),
+            )
             .when(cfg!(target_os = "macos"), |section| {
                 section.child(
                     controls::toggle_face(tr("show_dock_icon"), self.host.config.show_dock, true)
@@ -4208,7 +4458,7 @@ impl OpenMicro {
                 tr("backlight_pattern").to_uppercase(),
                 tr("pattern_key_note"),
                 controls::cycle_control(
-                    Self::pattern_label(self.host.config.led_key_pattern),
+                    Self::pattern_label(self.host.key_pattern()),
                     ("settings-key-pattern", 0usize).into(),
                     ("settings-key-pattern", 1usize).into(),
                     cx.listener(|this, _, _, cx| this.cycle_pattern(true, -1, cx)),
@@ -4219,7 +4469,7 @@ impl OpenMicro {
                 tr("ambient_pattern").to_uppercase(),
                 tr("pattern_ambient_note"),
                 controls::cycle_control(
-                    Self::pattern_label(self.host.config.led_ambient_pattern),
+                    Self::pattern_label(self.host.ambient_pattern()),
                     ("settings-ambient-pattern", 0usize).into(),
                     ("settings-ambient-pattern", 1usize).into(),
                     cx.listener(|this, _, _, cx| this.cycle_pattern(false, -1, cx)),
@@ -4601,6 +4851,15 @@ impl OpenMicro {
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.app_picker_for_profile {
+                            if let Some(app) = this.installed_apps.get(app_index) {
+                                let path = app.path.clone();
+                                this.host.link_app(&path);
+                            }
+                            this.sheet = Sheet::None;
+                            cx.notify();
+                            return;
+                        }
                         let Some(slot) = this.host.selected_slot else {
                             return;
                         };
@@ -4663,7 +4922,7 @@ impl OpenMicro {
                     .p(px(14.))
                     .flex()
                     .justify_between()
-                    .child(tiny_button(tr("clear")).id("clear-app-selection").on_click(
+                    .child(tiny_button(tr("clear")).id("clear-app-selection").when(self.app_picker_for_profile, |button| button.invisible()).on_click(
                         cx.listener(|this, _, _, cx| {
                             let Some(slot) = this.host.selected_slot else {
                                 return;
@@ -4860,14 +5119,7 @@ impl OpenMicro {
             for app in sorted_shortcut_applications() {
                 let app_matches = app.label.to_lowercase().contains(&query);
                 for preset in app.shortcuts {
-                    // Users search in whichever language they think in, so
-                    // match every localization of the label.
-                    if app_matches
-                        || preset
-                            .labels
-                            .iter()
-                            .any(|label| label.to_lowercase().contains(&query))
-                    {
+                    if app_matches || preset.label.to_lowercase().contains(&query) {
                         items = items.child(self.shortcut_pick_row(
                             ("shortcut-search", index),
                             app.id,

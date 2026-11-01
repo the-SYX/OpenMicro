@@ -7,7 +7,6 @@ description = "OpenMicro companion app: profiles, key actions, firmware updates 
 build = "build.rs"
 
 [dependencies]
-sys-locale = "0.3"
 async-channel = "2"
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
 gpui-component = "=0.5.1"
