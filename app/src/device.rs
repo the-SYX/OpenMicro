@@ -397,6 +397,9 @@ fn wait_for_device(
         if let Some((path, serial)) = stock::find(api) {
             if let Some(dev) = stock::open(api, &path) {
                 let alive = stock::serve(api, rx, &dev, &path, serial);
+                if alive {
+                    stock::pad_log("pad disconnected");
+                }
                 drop(dev);
                 events::post(DeviceMsg::Disconnected);
                 if !alive {

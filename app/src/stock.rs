@@ -49,6 +49,28 @@ const BATTERY_PERIOD: Duration = Duration::from_secs(120);
 const IDLE_DIM_AFTER: Duration = Duration::from_secs(60);
 /// Dimmed brightness, as a fraction of the configured brightness.
 const DIM_FRACTION: u16 = 10;
+/// How often the display's sleep state is checked.
+const DISPLAY_CHECK_PERIOD: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsAsleep(display: u32) -> u32;
+}
+
+/// True while the Mac's display sleeps (display off, system asleep or in a
+/// background dark wake). The pad answers every request, and macOS counts
+/// those answers from a Bluetooth keyboard as input that wakes the Mac, so
+/// nothing is sent to the pad meanwhile.
+fn display_asleep() -> bool {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
 const AGENT_KEYS: usize = 6;
 /// Marker appended to the version so the UI can tell this pad apart.
 pub const STOCK_SUFFIX: &str = " (stock Codex)";
@@ -303,6 +325,8 @@ struct State {
     /// agent status keys keep full brightness.
     dimmed: bool,
     last_input: Instant,
+    /// No writes while the display sleeps; the LEDs are refreshed on resume.
+    paused: bool,
     next_id: u16,
 }
 
@@ -322,6 +346,7 @@ impl State {
             agent_leds_dirty: false,
             dimmed: false,
             last_input: Instant::now(),
+            paused: false,
             next_id: 0,
         }
     }
@@ -363,6 +388,9 @@ impl State {
     }
 
     fn apply_leds(&mut self, dev: &HidDevice) {
+        if self.paused {
+            return;
+        }
         let id = self.id();
         let rgbcfg = rgbcfg_request(self.shown_keys, self.shown_ambient, self.shown_brightness(), id);
         let _ = write_msg(dev, &rgbcfg);
@@ -370,6 +398,9 @@ impl State {
     }
 
     fn apply_agent_leds(&mut self, dev: &HidDevice) {
+        if self.paused {
+            return;
+        }
         self.agent_leds_dirty = false;
         let id = self.id();
         let th = thstatus_request(
@@ -542,6 +573,7 @@ pub fn serve(
     let mut stick = Stick::default();
 
     let version = query_version(dev, &mut reader, &mut stick);
+    pad_log(&format!("pad connected ({version})"));
     events::post(DeviceMsg::Connected {
         version: format!("{version}{STOCK_SUFFIX}"),
         serial,
@@ -555,7 +587,23 @@ pub fn serve(
     let mut next_presence = Instant::now() + PRESENCE_PERIOD;
     let mut next_battery = Instant::now();
     let mut battery_id = None;
+    let mut next_display_check = Instant::now();
     loop {
+        if Instant::now() >= next_display_check {
+            next_display_check = Instant::now() + DISPLAY_CHECK_PERIOD;
+            let asleep = display_asleep();
+            if asleep != state.paused {
+                state.paused = asleep;
+                pad_log(if asleep { "display asleep: pad traffic paused" } else { "display awake: pad traffic resumed" });
+                if !asleep {
+                    // Catch up on everything that changed while paused.
+                    state.dimmed = false;
+                    state.last_input = Instant::now();
+                    state.apply_leds(dev);
+                    next_battery = Instant::now();
+                }
+            }
+        }
         loop {
             match rx.try_recv() {
                 Ok(cmd) => handle_cmd(dev, &mut state, cmd),
@@ -575,6 +623,7 @@ pub fn serve(
                         if let Some(battery) = parse_battery(&msg) {
                             events::post(battery);
                         }
+                        log_pad_status(&msg, state.last_input.elapsed());
                         continue;
                     }
                     if is_input(&msg) {
@@ -585,11 +634,11 @@ pub fn serve(
             }
             Err(_) => return true,
         }
-        if !state.dimmed && state.last_input.elapsed() >= IDLE_DIM_AFTER {
+        if !state.paused && !state.dimmed && state.last_input.elapsed() >= IDLE_DIM_AFTER {
             state.dimmed = true;
             state.apply_leds(dev);
         }
-        if Instant::now() >= next_battery {
+        if !state.paused && Instant::now() >= next_battery {
             next_battery = Instant::now() + BATTERY_PERIOD;
             let id = state.id();
             battery_id = Some(id as u64);
@@ -606,6 +655,48 @@ pub fn serve(
             }
         }
     }
+}
+
+/// Append one timestamped line to ~/Library/Logs/OpenMicro/pad-status.log,
+/// which records how the pad's power state changes over time.
+pub fn pad_log(line: &str) {
+    use std::io::Write;
+    let Some(dir) = dirs::home_dir().map(|home| home.join("Library/Logs/OpenMicro")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = std::process::Command::new("date")
+        .arg("+%Y-%m-%d %H:%M:%S")
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("pad-status.log"))
+    {
+        let _ = writeln!(file, "{stamp}  {line}");
+    }
+}
+
+/// Log the power-related fields of a `device.status` reply.
+fn log_pad_status(msg: &Value, idle: Duration) {
+    let Some(result) = msg.get("result") else {
+        return;
+    };
+    let field = |key: &str| result.get(key).map_or("?".to_string(), Value::to_string);
+    pad_log(&format!(
+        "idle {}s  standby {}  ble {}  host_suspended {}  auto_dimmed {}  led_idle {}  battery {}%  recovery {}",
+        idle.as_secs(),
+        field("battery_standby"),
+        field("ble_connected"),
+        field("ble_host_suspended"),
+        field("auto_dimmed"),
+        field("led_static_idle"),
+        field("battery_percent"),
+        field("ble_session_recovery_reason"),
+    ));
 }
 
 /// True for a key, knob or joystick notification.
