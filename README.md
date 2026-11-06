@@ -19,12 +19,14 @@ Upstream expects its own firmware with an on-device keymap. The stock pad has no
 - **Hold layers:** hold a trigger key to give the other controls a second set of bindings; a bare tap still runs the trigger's own binding. Two layer keys chord with each other in either order.
 - **Hold modifier:** a key can act as Shift/⌃/⌥/⌘ (or a mix) for as long as it's held, including on real mouse clicks. Its own hold layer still runs, with the held modifier lifted for those shortcuts.
 - **Per-profile lighting** and per-key colours (the six agent keys on stock hardware).
+- **Lighting effects:** the backlight and the ambient glow can each run a firmware effect (Breath, Snake or Rainbow) at slow, medium or fast speed (Settings → Pad → Backlight effect / Ambient effect).
+- **Separate ambient brightness:** Settings → Pad → Ambient brightness sets the glow apart from the key backlight; by default it follows the backlight.
 
 ### Knob
 - **App switcher** rotation preset: turning holds ⌘ and steps through apps (⌘Tab / ⌘⇧Tab). The selection commits when the knob rests for 0.8 s or when you press the knob.
 
 ### Claude Code status light
-- `agent-hook claude-code` hooks light keys 1–2: blue pulse while working, orange flash when it needs you, green when done, red on error. Multiple sessions take turns. Ambient lighting is left alone.
+- `agent-hook claude-code` hooks light keys 1–2: blue pulse while working (the pad's own breath effect on stock firmware, so it's smooth), orange flash when it needs you, green when done, red on error. Multiple sessions take turns. Ambient lighting is left alone.
 
 ### Shortcut presets
 - Multi-step presets: open an app, wait, press keys, type text (e.g. Slack search, Outlook calendar/mail, Obsidian command).

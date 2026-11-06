@@ -305,10 +305,16 @@ pub enum DeviceCmd {
         color: Option<(u8, u8, u8)>,
         /// A live status colour: stays at full brightness while idle-dimmed.
         status: bool,
+        /// Let the pad breathe the colour itself (stock pad only).
+        breathe: bool,
     },
     /// Minutes without input before the stock pad's lights dim (0 = never).
     SetStandby {
         minutes: u16,
+    },
+    /// Stock pad underglow brightness; None follows the backlight.
+    SetAmbientBrightness {
+        brightness: Option<u8>,
     },
     ReadKeymap,
     FactoryReset,
@@ -551,7 +557,8 @@ fn handle_cmd_offline(api: &mut HidApi, cmd: DeviceCmd) -> bool {
         | DeviceCmd::SetLedBrightness { .. }
         | DeviceCmd::SetTransientLedPattern { .. }
         | DeviceCmd::SetKeyLedOverride { .. }
-        | DeviceCmd::SetStandby { .. } => false,
+        | DeviceCmd::SetStandby { .. }
+        | DeviceCmd::SetAmbientBrightness { .. } => false,
     }
 }
 
@@ -687,6 +694,8 @@ fn session(api: &mut HidApi, rx: &mpsc::Receiver<DeviceCmd>, dev: &HidDevice) ->
                 }
                 // OpenMicro firmware manages its own idle behaviour.
                 Ok(DeviceCmd::SetStandby { .. }) => {}
+                // One brightness drives both chains on OpenMicro firmware.
+                Ok(DeviceCmd::SetAmbientBrightness { .. }) => {}
                 Ok(DeviceCmd::ReadKeymap) => match read_keymap(dev) {
                     Ok(keymap) => events::post(keymap.into_msg()),
                     Err(e) => events::post(DeviceMsg::SyncDone {

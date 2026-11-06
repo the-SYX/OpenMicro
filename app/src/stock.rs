@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    JoyMode, LedPattern, Slot, DEFAULT_JOY_MOUSE_SPEED, DEFAULT_LED_BRIGHTNESS, KEY_SLOTS,
+    JoyMode, LedEffect, LedPattern, Slot, DEFAULT_JOY_MOUSE_SPEED, DEFAULT_LED_BRIGHTNESS, KEY_SLOTS,
     SLOT_COUNT, SLOT_ENC_CCW, SLOT_ENC_CW, SLOT_ENC_PRESS, SLOT_JOY_DOWN, SLOT_JOY_LEFT,
     SLOT_JOY_RIGHT, SLOT_JOY_UP,
 };
@@ -237,12 +237,20 @@ fn joy_slot(dir: u8) -> usize {
     }
 }
 
-/// Firmware effect code + colour for a pattern.
-fn pattern_wire(pattern: LedPattern) -> (u8, u32) {
+/// Firmware effect code, colour and speed for a pattern.
+fn pattern_wire(pattern: LedPattern) -> (u8, u32, f32) {
     match pattern {
-        LedPattern::Rainbow => (3, 0xFFFFFF),
-        LedPattern::White => (1, 0xFFFFFF),
-        LedPattern::Solid { r, g, b } => (1, rgb(r, g, b)),
+        LedPattern::Rainbow => (3, 0xFFFFFF, 0.5),
+        LedPattern::White => (1, 0xFFFFFF, 0.5),
+        LedPattern::Solid { r, g, b } => (1, rgb(r, g, b), 0.5),
+        LedPattern::Animated { effect, r, g, b, speed } => {
+            let (e, c) = match effect {
+                LedEffect::Breath => (EFFECT_BREATH, rgb(r, g, b)),
+                LedEffect::Snake => (EFFECT_SNAKE, rgb(r, g, b)),
+                LedEffect::Rainbow => (EFFECT_RAINBOW, 0xFFFFFF),
+            };
+            (e, c, speed.wire())
+        }
     }
 }
 
@@ -255,27 +263,40 @@ fn level(brightness: u8) -> f32 {
 }
 
 fn group_json(pattern: LedPattern, brightness: u8) -> String {
-    let (e, c) = pattern_wire(pattern);
+    let (e, c, s) = pattern_wire(pattern);
     let e = if brightness == 0 { 0 } else { e };
-    format!(r#"{{"e":{e},"b":{:.2},"s":0.5,"c":{c}}}"#, level(brightness))
+    format!(r#"{{"e":{e},"b":{:.2},"s":{s},"c":{c}}}"#, level(brightness))
 }
 
 /// `v.oai.rgbcfg` for the key and ambient groups.
-pub fn rgbcfg_request(keys: LedPattern, ambient: LedPattern, brightness: u8, id: u16) -> String {
+pub fn rgbcfg_request(
+    keys: LedPattern,
+    ambient: LedPattern,
+    brightness: u8,
+    ambient_brightness: u8,
+    id: u16,
+) -> String {
     format!(
         r#"{{"method":"v.oai.rgbcfg","params":{{"ambient":{},"keys":{}}},"id":{id}}}"#,
-        group_json(ambient, brightness),
+        group_json(ambient, ambient_brightness),
         group_json(keys, brightness)
     )
 }
 
+/// Firmware effects (the device kit's numbering) and the Working speed.
+const EFFECT_SNAKE: u8 = 2;
+const EFFECT_RAINBOW: u8 = 3;
+const EFFECT_BREATH: u8 = 4;
+const BREATH_SPEED: f32 = 0.3;
+
 /// `v.oai.thstatus` for the six agent keys: an override colour where set,
 /// otherwise the key pattern. Status overrides show at `override_brightness`,
-/// everything else at `brightness`.
+/// everything else at `brightness`; `breathe` keys use the pad's breath effect.
 pub fn thstatus_request(
     keys: LedPattern,
     overrides: &[Option<(u8, u8, u8)>; AGENT_KEYS],
     status: &[bool; AGENT_KEYS],
+    breathe: &[bool; AGENT_KEYS],
     brightness: u8,
     override_brightness: u8,
     id: u16,
@@ -284,19 +305,23 @@ pub fn thstatus_request(
         .iter()
         .enumerate()
         .map(|(i, color)| {
-            let (e, c, brightness) = match color {
+            let (e, c, brightness, speed) = match color {
                 Some((r, g, b)) => {
                     let level = if status[i] { override_brightness } else { brightness };
-                    (1, rgb(*r, *g, *b), level)
+                    if breathe[i] {
+                        (EFFECT_BREATH, rgb(*r, *g, *b), level, BREATH_SPEED)
+                    } else {
+                        (1, rgb(*r, *g, *b), level, 0.5)
+                    }
                 }
                 None => {
-                    let (e, c) = pattern_wire(keys);
-                    (e, c, brightness)
+                    let (e, c, s) = pattern_wire(keys);
+                    (e, c, brightness, s)
                 }
             };
             let e = if brightness == 0 { 0 } else { e };
             format!(
-                r#"{{"id":{i},"c":{c},"b":{:.2},"e":{e},"s":0.5,"sk":0,"sa":0}}"#,
+                r#"{{"id":{i},"c":{c},"b":{:.2},"e":{e},"s":{speed},"sk":0,"sa":0}}"#,
                 level(brightness)
             )
         })
@@ -314,6 +339,8 @@ struct State {
     joy_mode: JoyMode,
     joy_mouse_speed: u8,
     led_brightness: u8,
+    /// Underglow level; None follows `led_brightness`.
+    ambient_brightness: Option<u8>,
     led_key_pattern: LedPattern,
     led_ambient_pattern: LedPattern,
     /// What the LEDs currently show (a transient pattern may differ from the
@@ -323,6 +350,8 @@ struct State {
     overrides: [Option<(u8, u8, u8)>; AGENT_KEYS],
     /// Overrides that show a live status (kept bright while dimmed).
     status_keys: [bool; AGENT_KEYS],
+    /// Overrides the pad breathes itself.
+    breathe_keys: [bool; AGENT_KEYS],
     /// Overrides changed since the last `v.oai.thstatus`; queued changes
     /// are coalesced into one write so neighbouring keys change together.
     agent_leds_dirty: bool,
@@ -345,12 +374,14 @@ impl State {
             joy_mode: JoyMode::default(),
             joy_mouse_speed: DEFAULT_JOY_MOUSE_SPEED,
             led_brightness: DEFAULT_LED_BRIGHTNESS,
+            ambient_brightness: None,
             led_key_pattern: LedPattern::default(),
             led_ambient_pattern: LedPattern::default(),
             shown_keys: LedPattern::default(),
             shown_ambient: LedPattern::default(),
             overrides: [None; AGENT_KEYS],
             status_keys: [false; AGENT_KEYS],
+            breathe_keys: [false; AGENT_KEYS],
             agent_leds_dirty: false,
             dimmed: false,
             dim_after: Some(Duration::from_secs(60)),
@@ -378,13 +409,22 @@ impl State {
         self.next_id
     }
 
-    /// The brightness the backlight and ambient light show right now.
-    fn shown_brightness(&self) -> u8 {
-        if self.dimmed && self.led_brightness > 0 {
-            ((self.led_brightness as u16 * DIM_FRACTION / 100) as u8).max(1)
+    /// `level` as shown right now (reduced while idle-dimmed).
+    fn dim(&self, level: u8) -> u8 {
+        if self.dimmed && level > 0 {
+            ((level as u16 * DIM_FRACTION / 100) as u8).max(1)
         } else {
-            self.led_brightness
+            level
         }
+    }
+
+    /// The brightness the backlight shows right now.
+    fn shown_brightness(&self) -> u8 {
+        self.dim(self.led_brightness)
+    }
+
+    fn shown_ambient_brightness(&self) -> u8 {
+        self.dim(self.ambient_brightness.unwrap_or(self.led_brightness))
     }
 
     /// Note pad input: restart the idle clock and undim.
@@ -401,7 +441,13 @@ impl State {
             return;
         }
         let id = self.id();
-        let rgbcfg = rgbcfg_request(self.shown_keys, self.shown_ambient, self.shown_brightness(), id);
+        let rgbcfg = rgbcfg_request(
+            self.shown_keys,
+            self.shown_ambient,
+            self.shown_brightness(),
+            self.shown_ambient_brightness(),
+            id,
+        );
         let _ = write_msg(dev, &rgbcfg);
         self.apply_agent_leds(dev);
     }
@@ -416,6 +462,7 @@ impl State {
             self.shown_keys,
             &self.overrides,
             &self.status_keys,
+            &self.breathe_keys,
             self.shown_brightness(),
             self.led_brightness,
             id,
@@ -793,6 +840,12 @@ fn handle_cmd(dev: &HidDevice, state: &mut State, cmd: DeviceCmd) {
             state.led_brightness = brightness;
             state.apply_leds(dev);
         }
+        DeviceCmd::SetAmbientBrightness { brightness } => {
+            if state.ambient_brightness != brightness {
+                state.ambient_brightness = brightness;
+                state.apply_leds(dev);
+            }
+        }
         DeviceCmd::SetTransientLedPattern {
             key_pattern,
             ambient_pattern,
@@ -803,11 +856,13 @@ fn handle_cmd(dev: &HidDevice, state: &mut State, cmd: DeviceCmd) {
                 state.apply_leds(dev);
             }
         }
-        DeviceCmd::SetKeyLedOverride { index, color, status } => {
+        DeviceCmd::SetKeyLedOverride { index, color, status, breathe } => {
             let i = index as usize;
-            if i < AGENT_KEYS && (state.overrides[i], state.status_keys[i]) != (color, status) {
+            let next = (color, status, breathe);
+            if i < AGENT_KEYS && (state.overrides[i], state.status_keys[i], state.breathe_keys[i]) != next {
                 state.overrides[i] = color;
                 state.status_keys[i] = status;
+                state.breathe_keys[i] = breathe;
                 state.agent_leds_dirty = true;
             }
         }
@@ -890,7 +945,10 @@ mod tests {
 
     #[test]
     fn led_requests_are_valid_json() {
-        let req = rgbcfg_request(LedPattern::Solid { r: 255, g: 0, b: 0 }, LedPattern::Rainbow, 255, 7);
+        let req = rgbcfg_request(LedPattern::Solid { r: 255, g: 0, b: 0 }, LedPattern::Rainbow, 255, 64, 7);
+        let v: Value = serde_json::from_str(&req).unwrap();
+        assert_eq!(v["params"]["keys"]["b"], 1.0);
+        assert_eq!(v["params"]["ambient"]["b"], 0.25);
         let v: Value = serde_json::from_str(&req).unwrap();
         assert_eq!(v["params"]["keys"]["c"], 0xFF0000);
         assert_eq!(v["params"]["ambient"]["e"], 3);
@@ -899,12 +957,28 @@ mod tests {
         overrides[3] = Some((0, 255, 0));
         let mut status = [false; AGENT_KEYS];
         status[2] = true;
-        let th = thstatus_request(LedPattern::White, &overrides, &status, 0, 255, 8);
+        let mut breathe = [false; AGENT_KEYS];
+        let th = thstatus_request(LedPattern::White, &overrides, &status, &breathe, 0, 255, 8);
         let v: Value = serde_json::from_str(&th).unwrap();
         assert_eq!(v["params"][2]["c"], 255);
         assert_eq!(v["params"][0]["e"], 0); // brightness 0 -> off
         assert_eq!(v["params"][2]["e"], 1); // a status override keeps its own level
         assert_eq!(v["params"][3]["e"], 0); // a profile colour dims with the rest
+        breathe[2] = true;
+        let th = thstatus_request(LedPattern::White, &overrides, &status, &breathe, 255, 255, 9);
+        let v: Value = serde_json::from_str(&th).unwrap();
+        assert_eq!(v["params"][2]["e"], EFFECT_BREATH); // Working breathes on the pad
+        assert_eq!(v["params"][3]["e"], 1);
+        let snake = LedPattern::Animated {
+            effect: LedEffect::Snake,
+            r: 0,
+            g: 255,
+            b: 255,
+            speed: crate::config::LedSpeed::Slow,
+        };
+        let v: Value = serde_json::from_str(&rgbcfg_request(snake, LedPattern::Rainbow, 255, 255, 10)).unwrap();
+        assert_eq!(v["params"]["keys"]["e"], EFFECT_SNAKE);
+        assert_eq!(v["params"]["keys"]["c"], 0x00FFFF);
     }
 
     #[test]

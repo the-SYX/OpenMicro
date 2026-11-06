@@ -787,15 +787,115 @@ pub enum LedPattern {
         g: u8,
         b: u8,
     },
+    /// A firmware animation (stock pad). Other pads show it steady. A
+    /// rainbow ignores the colour; a medium rainbow is plain `Rainbow`.
+    Animated {
+        effect: LedEffect,
+        r: u8,
+        g: u8,
+        b: u8,
+        speed: LedSpeed,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum LedEffect {
+    Breath,
+    Snake,
+    Rainbow,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LedSpeed {
+    Slow,
+    #[default]
+    Medium,
+    Fast,
+}
+
+impl LedSpeed {
+    /// The firmware's 0..1 animation speed.
+    pub fn wire(self) -> f32 {
+        match self {
+            LedSpeed::Slow => 0.15,
+            LedSpeed::Medium => 0.5,
+            LedSpeed::Fast => 0.9,
+        }
+    }
 }
 
 impl LedPattern {
     /// Wire form: [mode, r, g, b] with mode 0 rainbow / 1 solid.
     pub fn to_wire(self) -> [u8; 4] {
-        match self {
+        match self.steady() {
             LedPattern::Rainbow => [0, 0, 0, 0],
             LedPattern::White => [1, 255, 255, 255],
             LedPattern::Solid { r, g, b } => [1, r, g, b],
+            LedPattern::Animated { .. } => unreachable!(),
+        }
+    }
+
+    /// The colour choice without any animation.
+    pub fn steady(self) -> Self {
+        match self {
+            LedPattern::Animated {
+                effect: LedEffect::Rainbow,
+                ..
+            } => LedPattern::Rainbow,
+            LedPattern::Animated {
+                r: 255,
+                g: 255,
+                b: 255,
+                ..
+            } => LedPattern::White,
+            LedPattern::Animated { r, g, b, .. } => LedPattern::Solid { r, g, b },
+            other => other,
+        }
+    }
+
+    /// The animation, if any (a medium rainbow counts as one).
+    pub fn motion(self) -> Option<(LedEffect, LedSpeed)> {
+        match self {
+            LedPattern::Rainbow => Some((LedEffect::Rainbow, LedSpeed::Medium)),
+            LedPattern::Animated { effect, speed, .. } => Some((effect, speed)),
+            _ => None,
+        }
+    }
+
+    /// This colour choice with `motion`. A rainbow always moves (only its
+    /// speed applies); a colour can't take the rainbow effect.
+    pub fn with_motion(self, motion: Option<(LedEffect, LedSpeed)>) -> Self {
+        let base = self.steady();
+        let (r, g, b) = match base {
+            LedPattern::Rainbow => {
+                let speed = motion.map_or(LedSpeed::Medium, |(_, speed)| speed);
+                return if speed == LedSpeed::Medium {
+                    LedPattern::Rainbow
+                } else {
+                    LedPattern::Animated {
+                        effect: LedEffect::Rainbow,
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        speed,
+                    }
+                };
+            }
+            LedPattern::White => (255, 255, 255),
+            LedPattern::Solid { r, g, b } => (r, g, b),
+            LedPattern::Animated { .. } => unreachable!(),
+        };
+        match motion {
+            Some((effect, speed)) if effect != LedEffect::Rainbow => LedPattern::Animated {
+                effect,
+                r,
+                g,
+                b,
+                speed,
+            },
+            _ => base,
         }
     }
 
@@ -929,6 +1029,9 @@ pub struct AppConfig {
     /// Minutes without pad input before the lights dim (0 = never).
     #[serde(default = "default_standby_minutes")]
     pub standby_minutes: u16,
+    /// Underglow brightness on the stock pad; None follows `led_brightness`.
+    #[serde(default)]
+    pub ambient_brightness: Option<u8>,
 }
 
 pub const DEFAULT_STANDBY_MINUTES: u16 = 1;
@@ -954,6 +1057,7 @@ impl Default for AppConfig {
             activity_status_colors: ActivityStatusColors::default(),
             auto_switch: true,
             standby_minutes: DEFAULT_STANDBY_MINUTES,
+            ambient_brightness: None,
         }
     }
 }
@@ -1500,6 +1604,7 @@ fn migrate_legacy(legacy: LegacyConfig) -> AppConfig {
         activity_status_colors: ActivityStatusColors::default(),
         auto_switch: true,
         standby_minutes: DEFAULT_STANDBY_MINUTES,
+            ambient_brightness: None,
     }
 }
 
@@ -2336,6 +2441,7 @@ mod tests {
             activity_status_colors: ActivityStatusColors::default(),
             auto_switch: true,
             standby_minutes: DEFAULT_STANDBY_MINUTES,
+            ambient_brightness: None,
         };
         sanitize(&mut cfg);
         assert_eq!(cfg.active_profile, 0);
@@ -2488,4 +2594,28 @@ mod tests {
         assert_eq!(parsed.profiles[0].inputs[0].icon, "simple:github");
         assert_eq!(parsed.profiles[0].slots(), device_slots);
     }
+
+    #[test]
+    fn animated_patterns_round_trip_and_keep_their_colour() {
+        let snake = LedPattern::Solid { r: 0, g: 255, b: 255 }
+            .with_motion(Some((LedEffect::Snake, LedSpeed::Fast)));
+        let json = serde_json::to_string(&snake).unwrap();
+        assert_eq!(serde_json::from_str::<LedPattern>(&json).unwrap(), snake);
+        assert_eq!(snake.steady(), LedPattern::Solid { r: 0, g: 255, b: 255 });
+        assert_eq!(snake.to_wire(), [1, 0, 255, 255]);
+        // A rainbow only takes a speed; medium is the plain rainbow.
+        let slow = LedPattern::Rainbow.with_motion(Some((LedEffect::Breath, LedSpeed::Slow)));
+        assert_eq!(slow.motion(), Some((LedEffect::Rainbow, LedSpeed::Slow)));
+        assert_eq!(
+            slow.with_motion(Some((LedEffect::Rainbow, LedSpeed::Medium))),
+            LedPattern::Rainbow
+        );
+        // Switching a rainbow to a colour drops the rainbow effect.
+        assert_eq!(LedPattern::White.with_motion(LedPattern::Rainbow.motion()), LedPattern::White);
+        assert_eq!(
+            serde_json::from_str::<LedPattern>(r#"{"mode":"rainbow"}"#).unwrap(),
+            LedPattern::Rainbow
+        );
+    }
+
 }

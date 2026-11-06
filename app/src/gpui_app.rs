@@ -30,7 +30,7 @@ use crate::agent_integrations::{
 use crate::behaviors::{self, InstalledApp};
 use crate::boot;
 use crate::config::{
-    self, Action, ControlBehavior, InputConfig, JoystickMode, LedPattern,
+    self, Action, ControlBehavior, InputConfig, JoystickMode, LedEffect, LedPattern, LedSpeed,
     MacroStep, MacroStepEntry, MediaOp, ProfileTemplate, RotatorPressPreset, RotatorRotationPreset,
     SlotKind, ThemeSetting, KEY_SLOTS, SLOT_ENC_CCW, SLOT_ENC_CW, SLOT_ENC_PRESS, SLOT_JOY_DOWN,
     SLOT_JOY_LEFT, SLOT_JOY_PRESS, SLOT_JOY_RIGHT, SLOT_JOY_UP, SLOT_TOUCH_SWIPE_L,
@@ -1949,6 +1949,7 @@ impl OpenMicro {
                 .find(|(_, pr, pg, pb)| (*pr, *pg, *pb) == (r, g, b))
                 .map(|(key, ..)| tr(key).to_string())
                 .unwrap_or_else(|| tr("custom_existing").to_string()),
+            animated => Self::pattern_label(animated.steady()),
         }
     }
 
@@ -1998,7 +1999,7 @@ impl OpenMicro {
         } else {
             self.host.ambient_pattern()
         };
-        let index = match current {
+        let index = match current.steady() {
             LedPattern::Rainbow => 0,
             LedPattern::White => 1,
             LedPattern::Solid { r, g, b } => PATTERN_PALETTE
@@ -2006,6 +2007,7 @@ impl OpenMicro {
                 .position(|(_, pr, pg, pb)| (*pr, *pg, *pb) == (r, g, b))
                 .map(|i| i as i32 + 2)
                 .unwrap_or(0),
+            LedPattern::Animated { .. } => 0,
         };
         let next = (index + delta).rem_euclid(n);
         let pattern = match next {
@@ -2015,8 +2017,57 @@ impl OpenMicro {
                 let (_, r, g, b) = PATTERN_PALETTE[(i - 2) as usize];
                 LedPattern::Solid { r, g, b }
             }
-        };
+        }
+        .with_motion(current.motion());
         // Lighting belongs to the profile being edited.
+        let lighting = self.host.active_lighting_mut();
+        if key_chain {
+            lighting.key_pattern = pattern;
+        } else {
+            lighting.ambient_pattern = pattern;
+        }
+        self.commit(true, cx);
+    }
+
+    /// Animations a chain's colour can take: a rainbow only changes speed.
+    fn motion_choices(pattern: LedPattern) -> Vec<Option<(LedEffect, LedSpeed)>> {
+        const SPEEDS: [LedSpeed; 3] = [LedSpeed::Slow, LedSpeed::Medium, LedSpeed::Fast];
+        if pattern.steady() == LedPattern::Rainbow {
+            return SPEEDS.iter().map(|&s| Some((LedEffect::Rainbow, s))).collect();
+        }
+        std::iter::once(None)
+            .chain([LedEffect::Breath, LedEffect::Snake].into_iter().flat_map(|effect| {
+                SPEEDS.iter().map(move |&speed| Some((effect, speed)))
+            }))
+            .collect()
+    }
+
+    fn motion_label(pattern: LedPattern) -> String {
+        let speed = |speed| match speed {
+            LedSpeed::Slow => "slow",
+            LedSpeed::Medium => "medium",
+            LedSpeed::Fast => "fast",
+        };
+        match pattern.motion() {
+            None => "Steady".to_string(),
+            Some((LedEffect::Rainbow, s)) => format!("Rainbow · {}", speed(s)),
+            Some((LedEffect::Breath, s)) => format!("Breath · {}", speed(s)),
+            Some((LedEffect::Snake, s)) => format!("Snake · {}", speed(s)),
+        }
+    }
+
+    fn cycle_motion(&mut self, key_chain: bool, delta: isize, cx: &mut Context<Self>) {
+        let current = if key_chain {
+            self.host.key_pattern()
+        } else {
+            self.host.ambient_pattern()
+        };
+        let choices = Self::motion_choices(current);
+        let index = choices
+            .iter()
+            .position(|m| *m == current.motion())
+            .unwrap_or(0);
+        let pattern = current.with_motion(choices[wrapped_index(index, choices.len(), delta)]);
         let lighting = self.host.active_lighting_mut();
         if key_chain {
             lighting.key_pattern = pattern;
@@ -2090,6 +2141,7 @@ impl OpenMicro {
                     LedPattern::Solid { r, g, b } => (r as i32, g as i32, b as i32),
                     LedPattern::White => (255, 255, 255),
                     LedPattern::Rainbow => (0, 80, 255),
+                    LedPattern::Animated { r, g, b, .. } => (r as i32, g as i32, b as i32),
                 };
                 PATTERN_PALETTE
                     .iter()
@@ -2421,6 +2473,33 @@ impl OpenMicro {
             });
         }
         self.commit(true, cx);
+    }
+
+    /// Step the underglow's own level; stepping below 0% hands it back to
+    /// the backlight brightness.
+    fn adjust_ambient_brightness(&mut self, delta: i16, cx: &mut Context<Self>) {
+        let config = &mut self.host.config;
+        config.ambient_brightness = match config.ambient_brightness {
+            Some(0) if delta < 0 => None,
+            current => {
+                let level = current.unwrap_or(config.led_brightness) as i16;
+                Some((level + delta).clamp(0, 255) as u8)
+            }
+        };
+        if let Some(tx) = &self.host.device_tx {
+            let _ = tx.send(DeviceCmd::SetAmbientBrightness {
+                brightness: self.host.config.ambient_brightness,
+            });
+        }
+        self.commit(true, cx);
+    }
+
+    fn ambient_brightness_label(&self) -> String {
+        let percent = |level: u8| ((level as f32 / 255.0) * 100.0).round() as u32;
+        match self.host.config.ambient_brightness {
+            Some(level) => format!("{}%", percent(level)),
+            None => format!("Same as backlight ({}%)", percent(self.host.config.led_brightness)),
+        }
     }
 
     /// Native open-file panel. This must stay asynchronous: a blocking dialog
@@ -4665,6 +4744,17 @@ impl OpenMicro {
                 ),
             ))
             .child(inspector_field(
+                tr("ambient_brightness").to_uppercase(),
+                tr("ambient_brightness_note"),
+                controls::cycle_control(
+                    self.ambient_brightness_label(),
+                    ("settings-ambient-brightness", 0usize).into(),
+                    ("settings-ambient-brightness", 1usize).into(),
+                    cx.listener(|this, _, _, cx| this.adjust_ambient_brightness(-13, cx)),
+                    cx.listener(|this, _, _, cx| this.adjust_ambient_brightness(13, cx)),
+                ),
+            ))
+            .child(inspector_field(
                 tr("standby_after").to_uppercase(),
                 tr("standby_note"),
                 controls::cycle_control(
@@ -4687,6 +4777,17 @@ impl OpenMicro {
                 ),
             ))
             .child(inspector_field(
+                tr("backlight_effect").to_uppercase(),
+                tr("effect_note"),
+                controls::cycle_control(
+                    Self::motion_label(self.host.key_pattern()),
+                    ("settings-key-effect", 0usize).into(),
+                    ("settings-key-effect", 1usize).into(),
+                    cx.listener(|this, _, _, cx| this.cycle_motion(true, -1, cx)),
+                    cx.listener(|this, _, _, cx| this.cycle_motion(true, 1, cx)),
+                ),
+            ))
+            .child(inspector_field(
                 tr("ambient_pattern").to_uppercase(),
                 tr("pattern_ambient_note"),
                 controls::cycle_control(
@@ -4695,6 +4796,17 @@ impl OpenMicro {
                     ("settings-ambient-pattern", 1usize).into(),
                     cx.listener(|this, _, _, cx| this.cycle_pattern(false, -1, cx)),
                     cx.listener(|this, _, _, cx| this.cycle_pattern(false, 1, cx)),
+                ),
+            ))
+            .child(inspector_field(
+                tr("ambient_effect").to_uppercase(),
+                tr("effect_note"),
+                controls::cycle_control(
+                    Self::motion_label(self.host.ambient_pattern()),
+                    ("settings-ambient-effect", 0usize).into(),
+                    ("settings-ambient-effect", 1usize).into(),
+                    cx.listener(|this, _, _, cx| this.cycle_motion(false, -1, cx)),
+                    cx.listener(|this, _, _, cx| this.cycle_motion(false, 1, cx)),
                 ),
             ))
             .child(inspector_field(

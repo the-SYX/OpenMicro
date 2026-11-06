@@ -54,6 +54,7 @@ fn pattern_rgb(pattern: LedPattern) -> (u8, u8, u8) {
         LedPattern::Rainbow => (0, 96, 255),
         LedPattern::White => (255, 255, 255),
         LedPattern::Solid { r, g, b } => (r, g, b),
+        animated => pattern_rgb(animated.steady()),
     }
 }
 
@@ -155,7 +156,7 @@ pub struct HostState {
     activity_led_frame: usize,
     /// Last per-key LED override sent to the pad. A fresh connection has
     /// none (overrides are runtime-only), so nothing is sent until one is set.
-    key_led_sent: [Option<(Option<(u8, u8, u8)>, bool)>; KEY_SLOTS],
+    key_led_sent: [Option<(Option<(u8, u8, u8)>, bool, bool)>; KEY_SLOTS],
     /// The last frontmost app reported, so profiles switch only when the
     /// front app changes and a manual switch sticks until then.
     last_front_app: Option<String>,
@@ -266,7 +267,7 @@ impl HostState {
             activities: HashMap::new(),
             activity_epoch: 0,
             activity_led_frame: 0,
-            key_led_sent: [Some((None, false)); KEY_SLOTS],
+            key_led_sent: [Some((None, false, false)); KEY_SLOTS],
             last_front_app: None,
             editing_layer: None,
             held_layer: None,
@@ -434,6 +435,11 @@ impl HostState {
             && tx
                 .send(DeviceCmd::SetStandby {
                     minutes: self.config.standby_minutes,
+                })
+                .is_ok()
+            && tx
+                .send(DeviceCmd::SetAmbientBrightness {
+                    brightness: self.config.ambient_brightness,
                 })
                 .is_ok()
             && self.refresh_activity_led()
@@ -872,7 +878,7 @@ impl HostState {
                 boot,
             } => {
                 self.connected = true;
-                self.key_led_sent = [Some((None, false)); KEY_SLOTS];
+                self.key_led_sent = [Some((None, false, false)); KEY_SLOTS];
                 self.last_conn = Some((version, serial));
                 self.device_mode = mode;
                 self.select_profile_for_current_mode();
@@ -1234,18 +1240,21 @@ impl HostState {
                 .and_then(|agent| self.agent_led_color(agent))
                 .map(pattern_rgb);
             let status = status_color.is_some();
+            let breathe = status
+                && agent.is_some_and(|agent| self.agent_breathes_on_pad(agent));
             let color = status_color.or_else(|| lighting.key_color(index));
-            if self.key_led_sent[index] != Some((color, status)) {
+            if self.key_led_sent[index] != Some((color, status, breathe)) {
                 let ok = tx
                     .send(DeviceCmd::SetKeyLedOverride {
                         index: index as u8,
                         color,
                         status,
+                        breathe,
                     })
                     .is_ok();
                 sent &= ok;
                 if ok {
-                    self.key_led_sent[index] = Some((color, status));
+                    self.key_led_sent[index] = Some((color, status, breathe));
                 }
             }
         }
@@ -1291,6 +1300,8 @@ impl HostState {
         let color = self.config.activity_status_colors.get(status);
         let frame = self.activity_led_frame;
         let percent = match status {
+            // The stock pad breathes the colour itself (smoother than frames).
+            ActivityStatus::Working if self.stock_pad() => 100,
             ActivityStatus::Working => WORKING_PULSE[frame % WORKING_PULSE.len()],
             ActivityStatus::Attention if frame % 2 == 1 => 0,
             _ => 100,
@@ -1298,7 +1309,7 @@ impl HostState {
         let (r, g, b) = match color {
             LedPattern::Solid { r, g, b } => (r, g, b),
             LedPattern::White => (255, 255, 255),
-            LedPattern::Rainbow => return color,
+            LedPattern::Rainbow | LedPattern::Animated { .. } => return color,
         };
         let scale = |c: u8| (c as u16 * percent / 100) as u8;
         LedPattern::Solid {
@@ -1306,6 +1317,36 @@ impl HostState {
             g: scale(g),
             b: scale(b),
         }
+    }
+
+    fn stock_pad(&self) -> bool {
+        self.last_conn
+            .as_ref()
+            .is_some_and(|(version, _)| crate::stock::is_stock_version(version))
+    }
+
+    /// The agent key shows a steady Working status the stock pad can breathe
+    /// on its own.
+    fn agent_breathes_on_pad(&self, agent: usize) -> bool {
+        self.stock_pad() && self.agent_steady_status(agent) == Some(ActivityStatus::Working)
+    }
+
+    /// Claude shows its most urgent session; others show a lone session.
+    /// None when there is nothing to show or several sessions take turns.
+    fn agent_steady_status(&self, agent: usize) -> Option<ActivityStatus> {
+        let prefix = AGENT_NAMESPACES[agent];
+        let sessions: Vec<_> = self
+            .activities
+            .iter()
+            .filter(|(id, _)| id.starts_with(prefix))
+            .collect();
+        if agent != 0 && sessions.len() != 1 {
+            return None;
+        }
+        sessions
+            .iter()
+            .map(|(_, activity)| activity.status)
+            .max_by_key(|status| status.priority())
     }
 
     fn agent_led_color(&self, agent: usize) -> Option<LedPattern> {
@@ -1319,12 +1360,7 @@ impl HostState {
         if sessions.is_empty() {
             return None;
         }
-        // Claude shows its most urgent session; others show a lone session.
-        if agent == 0 || sessions.len() == 1 {
-            let status = sessions
-                .iter()
-                .map(|(_, activity)| activity.status)
-                .max_by_key(|status| status.priority())?;
+        if let Some(status) = self.agent_steady_status(agent) {
             return Some(self.animated_status_color(status));
         }
 
@@ -2402,6 +2438,25 @@ mod tests {
         assert_eq!(bright, Some(colors.working));
         assert_ne!(dim, bright);
         assert_ne!(dim, Some(black));
+    }
+
+    #[test]
+    fn stock_pad_breathes_working_itself() {
+        let mut host = state();
+        host.last_conn = Some((
+            format!("0.1.43-ai-micro{}", crate::stock::STOCK_SUFFIX),
+            String::new(),
+        ));
+        host.handle_event(AppEvent::Activity(ActivityEvent {
+            session_id: "claude-code:a".into(),
+            turn_id: None,
+            status: ActivityStatus::Working,
+            begins_turn: true,
+        }));
+        host.activity_led_frame = 4;
+        assert_eq!(host.agent_led_color(0), Some(host.config.activity_status_colors.working));
+        assert!(host.agent_breathes_on_pad(0));
+        assert!(!host.agent_breathes_on_pad(1));
     }
 
     #[test]
