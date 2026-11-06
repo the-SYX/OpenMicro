@@ -155,7 +155,7 @@ pub struct HostState {
     activity_led_frame: usize,
     /// Last per-key LED override sent to the pad. A fresh connection has
     /// none (overrides are runtime-only), so nothing is sent until one is set.
-    key_led_sent: [Option<Option<(u8, u8, u8)>>; KEY_SLOTS],
+    key_led_sent: [Option<(Option<(u8, u8, u8)>, bool)>; KEY_SLOTS],
     /// The last frontmost app reported, so profiles switch only when the
     /// front app changes and a manual switch sticks until then.
     last_front_app: Option<String>,
@@ -167,6 +167,9 @@ pub struct HostState {
     /// The hold-layer key currently held on the pad, and whether another
     /// control was used while it was down (a bare tap runs its own action).
     held_layer: Option<(usize, bool)>,
+    /// A held-modifier key that is down, and the modifiers it holds, so the
+    /// release lifts them even if the profile changed in between.
+    held_mods: Option<(usize, u8)>,
 
     pub intercept: Option<Intercept>,
     pub menubar: Option<Menubar>,
@@ -263,10 +266,11 @@ impl HostState {
             activities: HashMap::new(),
             activity_epoch: 0,
             activity_led_frame: 0,
-            key_led_sent: [Some(None); KEY_SLOTS],
+            key_led_sent: [Some((None, false)); KEY_SLOTS],
             last_front_app: None,
             editing_layer: None,
             held_layer: None,
+            held_mods: None,
             intercept: None,
             menubar: None,
             release: None,
@@ -427,6 +431,11 @@ impl HostState {
             led_ambient_pattern: self.ambient_pattern(),
         })
         .is_ok()
+            && tx
+                .send(DeviceCmd::SetStandby {
+                    minutes: self.config.standby_minutes,
+                })
+                .is_ok()
             && self.refresh_activity_led()
     }
 
@@ -576,10 +585,18 @@ impl HostState {
                     *input = inherited.clone();
                 }
             }
-            // Hold layers the profile doesn't define come from the default.
+            // Hold layers the profile doesn't define come from the default;
+            // empty controls in a layer it does define inherit per control.
             for layer in &fallback.layers {
-                if !profile.layers.iter().any(|own| own.trigger == layer.trigger) {
-                    profile.layers.push(layer.clone());
+                match profile.layers.iter_mut().find(|own| own.trigger == layer.trigger) {
+                    Some(own) => {
+                        for (input, inherited) in own.inputs.iter_mut().zip(&layer.inputs) {
+                            if input.is_unbound() {
+                                *input = inherited.clone();
+                            }
+                        }
+                    }
+                    None => profile.layers.push(layer.clone()),
                 }
             }
         }
@@ -855,7 +872,7 @@ impl HostState {
                 boot,
             } => {
                 self.connected = true;
-                self.key_led_sent = [Some(None); KEY_SLOTS];
+                self.key_led_sent = [Some((None, false)); KEY_SLOTS];
                 self.last_conn = Some((version, serial));
                 self.device_mode = mode;
                 self.select_profile_for_current_mode();
@@ -962,7 +979,57 @@ impl HostState {
             return;
         }
         let profile = self.active_device_profile();
-        let is_trigger = profile.layers.iter().any(|layer| layer.trigger == slot);
+        // A held-modifier key is down exactly as long as the control is.
+        if !pressed {
+            if let Some((_, mods)) = self.held_mods.filter(|(held, _)| *held == slot) {
+                self.held_mods = None;
+                actions::hold_modifiers(mods, false);
+                return;
+            }
+        }
+        // The held-modifier key's layer runs without the held modifiers, so
+        // it can carry shortcuts too.
+        if let Some((held, mods)) = self.held_mods.filter(|_| pressed) {
+            let layered = profile
+                .layers
+                .iter()
+                .find(|layer| layer.trigger == held)
+                .and_then(|layer| layer.inputs.get(slot))
+                .filter(|input| !input.is_unbound())
+                .cloned();
+            if let Some(input) = layered {
+                actions::hold_modifiers(mods, false);
+                self.run_input_now(input, effects);
+                actions::hold_modifiers(mods, true);
+                return;
+            }
+        }
+        // While a layer key is held, its binding for this key beats the hold.
+        let layer_binds = |held: usize| {
+            profile
+                .layers
+                .iter()
+                .find(|layer| layer.trigger == held)
+                .and_then(|layer| layer.inputs.get(slot))
+                .is_some_and(|input| !input.is_unbound())
+        };
+        let held_layer_binds = self.held_layer.is_some_and(|(held, _)| layer_binds(held));
+        if let Some(Action::HoldModifier { mods }) = profile
+            .inputs
+            .get(slot)
+            .map(|i| &i.action)
+            .filter(|_| !held_layer_binds)
+        {
+            if pressed {
+                self.held_mods = Some((slot, *mods));
+                actions::hold_modifiers(*mods, true);
+            }
+            return;
+        }
+        // Another layer key pressed while one is held is a normal control of
+        // the held layer, so two layer keys can chord with each other.
+        let is_trigger = profile.layers.iter().any(|layer| layer.trigger == slot)
+            && self.held_layer.map_or(true, |(held, _)| held == slot);
         if is_trigger {
             if pressed {
                 self.held_layer = Some((slot, false));
@@ -1004,18 +1071,32 @@ impl HostState {
     }
 
     fn run_input(&mut self, input: InputConfig, effects: &mut Vec<HostEffect>) {
+        self.dispatch_input(input, effects, actions::execute);
+    }
+
+    /// `run_input`, but finished before returning.
+    fn run_input_now(&mut self, input: InputConfig, effects: &mut Vec<HostEffect>) {
+        self.dispatch_input(input, effects, actions::execute_now);
+    }
+
+    fn dispatch_input(
+        &mut self,
+        input: InputConfig,
+        effects: &mut Vec<HostEffect>,
+        execute: fn(&Action),
+    ) {
         match input.action {
             Action::AppSettings => push_open_settings(effects),
             Action::None => {
                 let emitted = input.emitted;
                 match emitted.kind {
                     SlotKind::None => {}
-                    SlotKind::Keyboard => actions::execute(&Action::Keystroke {
+                    SlotKind::Keyboard => execute(&Action::Keystroke {
                         mods: emitted.mods,
                         key: emitted.code,
                     }),
                     SlotKind::Consumer => match consumer_media_op(emitted.code) {
-                        Some(op) => actions::execute(&Action::Media { op }),
+                        Some(op) => execute(&Action::Media { op }),
                         None => self.push_log(format!(
                             "consumer usage 0x{:02X} can't be sent from the Mac",
                             emitted.code
@@ -1023,7 +1104,7 @@ impl HostState {
                     },
                 }
             }
-            action => actions::execute(&action),
+            action => execute(&action),
         }
     }
 
@@ -1148,21 +1229,23 @@ impl HostState {
                 .iter()
                 .find(|(key, _)| *key == index)
                 .map(|(_, agent)| *agent);
-            let color = agent
+            let status_color = agent
                 .filter(|_| mapped_active)
                 .and_then(|agent| self.agent_led_color(agent))
-                .map(pattern_rgb)
-                .or_else(|| lighting.key_color(index));
-            if self.key_led_sent[index] != Some(color) {
+                .map(pattern_rgb);
+            let status = status_color.is_some();
+            let color = status_color.or_else(|| lighting.key_color(index));
+            if self.key_led_sent[index] != Some((color, status)) {
                 let ok = tx
                     .send(DeviceCmd::SetKeyLedOverride {
                         index: index as u8,
                         color,
+                        status,
                     })
                     .is_ok();
                 sent &= ok;
                 if ok {
-                    self.key_led_sent[index] = Some(color);
+                    self.key_led_sent[index] = Some((color, status));
                 }
             }
         }
@@ -1732,6 +1815,33 @@ mod tests {
     }
 
     #[test]
+    fn two_layer_keys_chord_with_each_other() {
+        let settings = InputConfig {
+            action: Action::AppSettings,
+            ..config::unbound_input()
+        };
+        let mut host = state();
+        let profile = host.add_profile(config::ProfileTemplate::Empty);
+        host.switch_profile(profile);
+        host.set_default_profile(profile);
+        host.toggle_layer(0);
+        host.toggle_layer(1);
+        host.enter_layer_edit(1);
+        host.active_profile_mut().inputs[0] = settings.clone();
+        host.exit_layer_edit();
+
+        // Hold key 2, press key 1: key 2's layer binding for key 1 runs and
+        // neither release taps anything.
+        assert!(host_press(&mut host, 1, true).is_empty());
+        assert_eq!(host_press(&mut host, 0, true), [HostEffect::OpenSettings]);
+        assert!(host_press(&mut host, 0, false).is_empty());
+        assert!(host_press(&mut host, 1, false).is_empty());
+        // Afterwards key 1 is a layer key again.
+        assert!(host_press(&mut host, 0, true).is_empty());
+        assert!(host_press(&mut host, 0, false).is_empty());
+    }
+
+    #[test]
     fn editing_a_layer_never_saves_or_syncs_the_swapped_inputs() {
         let mut host = state();
         let base = host.active_profile().inputs.clone();
@@ -2183,7 +2293,7 @@ mod tests {
     ) -> [Option<Option<(u8, u8, u8)>>; KEY_SLOTS] {
         let mut latest = [None; KEY_SLOTS];
         while let Ok(cmd) = rx.try_recv() {
-            if let DeviceCmd::SetKeyLedOverride { index, color } = cmd {
+            if let DeviceCmd::SetKeyLedOverride { index, color, .. } = cmd {
                 latest[index as usize] = Some(color);
             }
         }
@@ -2215,7 +2325,7 @@ mod tests {
                     led_ambient_pattern,
                     ..
                 } => synced = Some((led_key_pattern, led_ambient_pattern)),
-                DeviceCmd::SetKeyLedOverride { index, color } => {
+                DeviceCmd::SetKeyLedOverride { index, color, .. } => {
                     latest[index as usize] = Some(color)
                 }
                 _ => {}

@@ -45,8 +45,6 @@ const EVENT_READ_MS: i32 = 30;
 const PRESENCE_PERIOD: Duration = Duration::from_secs(2);
 /// How often the battery is read with `device.status`.
 const BATTERY_PERIOD: Duration = Duration::from_secs(120);
-/// Idle time after which the backlight and ambient light dim.
-const IDLE_DIM_AFTER: Duration = Duration::from_secs(60);
 /// Dimmed brightness, as a fraction of the configured brightness.
 const DIM_FRACTION: u16 = 10;
 /// How often the display's sleep state is checked.
@@ -271,11 +269,13 @@ pub fn rgbcfg_request(keys: LedPattern, ambient: LedPattern, brightness: u8, id:
     )
 }
 
-/// `v.oai.thstatus` for the six agent keys: an override colour (at
-/// `override_brightness`) where set, otherwise the key pattern.
+/// `v.oai.thstatus` for the six agent keys: an override colour where set,
+/// otherwise the key pattern. Status overrides show at `override_brightness`,
+/// everything else at `brightness`.
 pub fn thstatus_request(
     keys: LedPattern,
     overrides: &[Option<(u8, u8, u8)>; AGENT_KEYS],
+    status: &[bool; AGENT_KEYS],
     brightness: u8,
     override_brightness: u8,
     id: u16,
@@ -285,7 +285,10 @@ pub fn thstatus_request(
         .enumerate()
         .map(|(i, color)| {
             let (e, c, brightness) = match color {
-                Some((r, g, b)) => (1, rgb(*r, *g, *b), override_brightness),
+                Some((r, g, b)) => {
+                    let level = if status[i] { override_brightness } else { brightness };
+                    (1, rgb(*r, *g, *b), level)
+                }
                 None => {
                     let (e, c) = pattern_wire(keys);
                     (e, c, brightness)
@@ -318,12 +321,16 @@ struct State {
     shown_keys: LedPattern,
     shown_ambient: LedPattern,
     overrides: [Option<(u8, u8, u8)>; AGENT_KEYS],
+    /// Overrides that show a live status (kept bright while dimmed).
+    status_keys: [bool; AGENT_KEYS],
     /// Overrides changed since the last `v.oai.thstatus`; queued changes
     /// are coalesced into one write so neighbouring keys change together.
     agent_leds_dirty: bool,
-    /// The backlight and ambient light are dimmed after a quiet spell; the
-    /// agent status keys keep full brightness.
+    /// The LEDs dim after a quiet spell; keys showing a live status keep
+    /// full brightness.
     dimmed: bool,
+    /// Idle time before dimming; `None` never dims.
+    dim_after: Option<Duration>,
     last_input: Instant,
     /// No writes while the display sleeps; the LEDs are refreshed on resume.
     paused: bool,
@@ -343,8 +350,10 @@ impl State {
             shown_keys: LedPattern::default(),
             shown_ambient: LedPattern::default(),
             overrides: [None; AGENT_KEYS],
+            status_keys: [false; AGENT_KEYS],
             agent_leds_dirty: false,
             dimmed: false,
+            dim_after: Some(Duration::from_secs(60)),
             last_input: Instant::now(),
             paused: false,
             next_id: 0,
@@ -406,6 +415,7 @@ impl State {
         let th = thstatus_request(
             self.shown_keys,
             &self.overrides,
+            &self.status_keys,
             self.shown_brightness(),
             self.led_brightness,
             id,
@@ -634,7 +644,10 @@ pub fn serve(
             }
             Err(_) => return true,
         }
-        if !state.paused && !state.dimmed && state.last_input.elapsed() >= IDLE_DIM_AFTER {
+        if !state.paused
+            && !state.dimmed
+            && state.dim_after.is_some_and(|after| state.last_input.elapsed() >= after)
+        {
             state.dimmed = true;
             state.apply_leds(dev);
         }
@@ -687,7 +700,7 @@ fn log_pad_status(msg: &Value, idle: Duration) {
     };
     let field = |key: &str| result.get(key).map_or("?".to_string(), Value::to_string);
     pad_log(&format!(
-        "idle {}s  standby {}  ble {}  host_suspended {}  auto_dimmed {}  led_idle {}  battery {}%  recovery {}",
+        "idle {}s  standby {}  ble {}  host_suspended {}  auto_dimmed {}  led_idle {}  battery {}%  charging {}  recovery {}",
         idle.as_secs(),
         field("battery_standby"),
         field("ble_connected"),
@@ -695,7 +708,24 @@ fn log_pad_status(msg: &Value, idle: Duration) {
         field("auto_dimmed"),
         field("led_static_idle"),
         field("battery_percent"),
+        field("battery_charging"),
         field("ble_session_recovery_reason"),
+    ));
+    // Bluetooth slot and bond state, to explain a pad that won't reconnect.
+    pad_log(&format!(
+        "  mode {} (pref {})  bonds {}/{}  slot_bound {}  adv {}  pairing {}  stale_clears {}  peer_deletes {}  store_full {}  recovery_attempts {}  exhausted {}",
+        field("connection_mode"),
+        field("preferred_connection_mode"),
+        field("ble_bond_count"),
+        field("ble_bond_capacity"),
+        field("ble_slot_bound"),
+        field("ble_advertising"),
+        field("ble_pairing"),
+        field("ble_stale_slot_clear_events"),
+        field("ble_peer_delete_attempts"),
+        field("ble_store_full_events"),
+        field("ble_session_recovery_attempts"),
+        field("ble_session_recovery_exhausted"),
     ));
 }
 
@@ -773,11 +803,19 @@ fn handle_cmd(dev: &HidDevice, state: &mut State, cmd: DeviceCmd) {
                 state.apply_leds(dev);
             }
         }
-        DeviceCmd::SetKeyLedOverride { index, color } => {
+        DeviceCmd::SetKeyLedOverride { index, color, status } => {
             let i = index as usize;
-            if i < AGENT_KEYS && state.overrides[i] != color {
+            if i < AGENT_KEYS && (state.overrides[i], state.status_keys[i]) != (color, status) {
                 state.overrides[i] = color;
+                state.status_keys[i] = status;
                 state.agent_leds_dirty = true;
+            }
+        }
+        DeviceCmd::SetStandby { minutes } => {
+            state.dim_after = (minutes > 0).then(|| Duration::from_secs(minutes as u64 * 60));
+            if state.dimmed && state.dim_after.map_or(true, |after| state.last_input.elapsed() < after) {
+                state.dimmed = false;
+                state.apply_leds(dev);
             }
         }
         DeviceCmd::ReadKeymap => events::post(state.keymap_msg()),
@@ -858,11 +896,15 @@ mod tests {
         assert_eq!(v["params"]["ambient"]["e"], 3);
         let mut overrides = [None; AGENT_KEYS];
         overrides[2] = Some((0, 0, 255));
-        let th = thstatus_request(LedPattern::White, &overrides, 0, 255, 8);
+        overrides[3] = Some((0, 255, 0));
+        let mut status = [false; AGENT_KEYS];
+        status[2] = true;
+        let th = thstatus_request(LedPattern::White, &overrides, &status, 0, 255, 8);
         let v: Value = serde_json::from_str(&th).unwrap();
         assert_eq!(v["params"][2]["c"], 255);
         assert_eq!(v["params"][0]["e"], 0); // brightness 0 -> off
-        assert_eq!(v["params"][2]["e"], 1); // the override keeps its own level
+        assert_eq!(v["params"][2]["e"], 1); // a status override keeps its own level
+        assert_eq!(v["params"][3]["e"], 0); // a profile colour dims with the rest
     }
 
     #[test]

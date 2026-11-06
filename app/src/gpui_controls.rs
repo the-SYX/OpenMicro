@@ -55,9 +55,14 @@ pub fn keycap_device_cell(
     label: impl Into<SharedString>,
     icon: Option<AnyElement>,
     detail: impl Into<SharedString>,
+    number: Option<usize>,
+    size: f32,
+    round: bool,
     visual: CellVisual,
 ) -> Div {
     let label = label.into();
+    // Text grows with the tile, from 12 px at the 96 px minimum.
+    let text = (size / 8.).clamp(12., 16.);
     let detail = detail.into();
 
     let outline = if visual.warning {
@@ -90,6 +95,53 @@ pub fn keycap_device_cell(
         success_color()
     };
 
+    if round {
+        // Knob, joystick and touch pad: a circle with its contents centred.
+        return div()
+            .w(px(size))
+            .h(px(size))
+            .flex_none()
+            .p(px(size * 0.16))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(4.))
+            .bg(background)
+            .when(visual.selected || visual.live || visual.warning, |cell| {
+                cell.border_2().border_color(outline)
+            })
+            .rounded_full()
+            .overflow_hidden()
+            .font_family(SYSTEM_FONT)
+            .text_color(foreground)
+            .children(icon)
+            .child(
+                div()
+                    .max_w_full()
+                    .truncate()
+                    .text_size(px(text - 1.))
+                    .font_semibold()
+                    .child(label),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .line_clamp(2)
+                    .text_size(px(text - 1.))
+                    .text_color(muted_text_color())
+                    .child(detail),
+            )
+            .hover(|style| {
+                style.bg(if visual.selected {
+                    accent_soft_color()
+                } else {
+                    raised_color()
+                })
+            });
+    }
+
     let heading = div()
         .w_full()
         .flex()
@@ -98,12 +150,22 @@ pub fn keycap_device_cell(
         .when(visual.warning || visual.live, |heading| {
             heading.child(div().w(px(5.)).h(px(5.)).bg(state_color))
         })
+        .when_some(number, |heading, number| {
+            heading.child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(MONO_FONT)
+                    .text_size(px(text - 2.))
+                    .text_color(dim_text_color())
+                    .child(number.to_string()),
+            )
+        })
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
-                .text_size(px(12.))
+                .text_size(px(text))
                 .font_family(SYSTEM_FONT)
                 .font_semibold()
                 .text_color(foreground)
@@ -125,8 +187,8 @@ pub fn keycap_device_cell(
     };
 
     let cell = div()
-        .w(px(96.))
-        .h(px(96.))
+        .w(px(size))
+        .h(px(size))
         .flex_none()
         .p(px(10.))
         .flex()
@@ -147,10 +209,14 @@ pub fn keycap_device_cell(
                 .min_w(px(0.))
                 .flex()
                 .items_center()
-                .truncate()
-                .text_size(px(12.))
-                .text_color(muted_text_color())
-                .child(detail),
+                .child(
+                    div()
+                        .w_full()
+                        .line_clamp(2)
+                        .text_size(px(text))
+                        .text_color(muted_text_color())
+                        .child(detail),
+                ),
         )
         .hover(|style| {
             style.bg(if visual.selected {

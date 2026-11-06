@@ -303,6 +303,12 @@ pub enum DeviceCmd {
     SetKeyLedOverride {
         index: u8,
         color: Option<(u8, u8, u8)>,
+        /// A live status colour: stays at full brightness while idle-dimmed.
+        status: bool,
+    },
+    /// Minutes without input before the stock pad's lights dim (0 = never).
+    SetStandby {
+        minutes: u16,
     },
     ReadKeymap,
     FactoryReset,
@@ -544,7 +550,8 @@ fn handle_cmd_offline(api: &mut HidApi, cmd: DeviceCmd) -> bool {
         DeviceCmd::ReadKeymap
         | DeviceCmd::SetLedBrightness { .. }
         | DeviceCmd::SetTransientLedPattern { .. }
-        | DeviceCmd::SetKeyLedOverride { .. } => false,
+        | DeviceCmd::SetKeyLedOverride { .. }
+        | DeviceCmd::SetStandby { .. } => false,
     }
 }
 
@@ -662,7 +669,7 @@ fn session(api: &mut HidApi, rx: &mpsc::Receiver<DeviceCmd>, dev: &HidDevice) ->
                         REPLY_TIMEOUT,
                     );
                 }
-                Ok(DeviceCmd::SetKeyLedOverride { index, color }) => {
+                Ok(DeviceCmd::SetKeyLedOverride { index, color, .. }) => {
                     if key_led_override_supported && index < 13 {
                         let (enabled, r, g, b) = color
                             .map(|(r, g, b)| (1, r, g, b))
@@ -678,6 +685,8 @@ fn session(api: &mut HidApi, rx: &mpsc::Receiver<DeviceCmd>, dev: &HidDevice) ->
                         .is_ok();
                     }
                 }
+                // OpenMicro firmware manages its own idle behaviour.
+                Ok(DeviceCmd::SetStandby { .. }) => {}
                 Ok(DeviceCmd::ReadKeymap) => match read_keymap(dev) {
                     Ok(keymap) => events::post(keymap.into_msg()),
                     Err(e) => events::post(DeviceMsg::SyncDone {

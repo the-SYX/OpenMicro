@@ -10,8 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    default_codex_profile, Action, ControlBehavior, InputConfig, MacOsControl, Profile, Slot,
-    SlotKind,
+    default_codex_profile, Action, ControlBehavior, InputConfig, MacOsControl, MacroStep,
+    MacroStepEntry, Profile, Slot, SlotKind,
 };
 use crate::keycodes::{keyboard_name, mods_label};
 
@@ -22,12 +22,51 @@ pub struct ShortcutPreset {
     pub label: &'static str,
     pub mods: u8,
     pub key: u16,
+    /// Non-empty for multi-step presets (open the app, press keys, type
+    /// text); `mods`/`key` are then unused.
+    pub steps: &'static [PresetStep],
 }
 
 impl ShortcutPreset {
     pub fn label(&self) -> &'static str {
         self.label
     }
+
+    pub fn is_sequence(&self) -> bool {
+        !self.steps.is_empty()
+    }
+}
+
+/// One step of a multi-step shortcut preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresetStep {
+    Open(&'static str),
+    Key(u8, u16),
+    Type(&'static str),
+    Delay(u64),
+}
+
+/// The macro a multi-step preset runs.
+pub fn preset_macro(steps: &[PresetStep]) -> Vec<MacroStepEntry> {
+    let mut out = Vec::new();
+    for step in steps {
+        match *step {
+            PresetStep::Open(target) => out.push(MacroStep::Open {
+                target: target.to_string(),
+            }),
+            PresetStep::Key(mods, key) => out.push(MacroStep::Keystroke {
+                mods: shortcut_mods_for_host(mods),
+                key,
+            }),
+            PresetStep::Type(text) => {
+                out.extend(text.chars().filter_map(crate::actions::key_for_char).map(
+                    |(mods, key)| MacroStep::Keystroke { mods, key },
+                ))
+            }
+            PresetStep::Delay(ms) => out.push(MacroStep::Delay { ms }),
+        }
+    }
+    out.into_iter().map(MacroStepEntry::from).collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +158,19 @@ const TERMINAL_SHORTCUTS: &[ShortcutPreset] = &[
 ];
 
 const SLACK_SHORTCUTS: &[ShortcutPreset] = &[
+    sequence(
+        "search_you",
+        "Search \u{201C}you\u{201D}",
+        &[
+            PresetStep::Open("/Applications/Slack.app"),
+            PresetStep::Delay(500),
+            PresetStep::Key(0x08, 0x0a), // ⌘G
+            PresetStep::Delay(200),
+            PresetStep::Type("you"),
+            PresetStep::Delay(100),
+            PresetStep::Key(0x08, 0x28), // ⌘Return
+        ],
+    ),
     shortcut("quick_switcher", "Quick switcher", 0x08, 0x0e),
     shortcut("unreads", "All unreads", 0x0a, 0x04),
     shortcut("dms", "Direct messages", 0x0a, 0x0e),
@@ -375,7 +427,47 @@ const NOTION_SHORTCUTS: &[ShortcutPreset] = &[
     shortcut("new_window", "New Window", 0x0a, 0x11),
 ];
 
+const OUTLOOK_SHORTCUTS: &[ShortcutPreset] = &[
+    sequence(
+        "open_calendar",
+        "Open Calendar",
+        &[
+            PresetStep::Open("/Applications/Microsoft Outlook.app"),
+            PresetStep::Delay(500),
+            PresetStep::Key(0x08, 0x1f), // ⌘2
+        ],
+    ),
+    sequence(
+        "open_mail",
+        "Open Mail",
+        &[
+            PresetStep::Open("/Applications/Microsoft Outlook.app"),
+            PresetStep::Delay(500),
+            PresetStep::Key(0x08, 0x1e), // ⌘1
+        ],
+    ),
+    shortcut("calendar", "Calendar", 0x08, 0x1f),
+    shortcut("mail", "Mail", 0x08, 0x1e),
+    shortcut("new_item", "New email / event", 0x08, 0x11),
+    shortcut("reply", "Reply", 0x08, 0x15),
+    shortcut("reply_all", "Reply all", 0x0a, 0x15),
+    shortcut("forward", "Forward", 0x08, 0x0d),
+];
+
 const OBSIDIAN_SHORTCUTS: &[ShortcutPreset] = &[
+    sequence(
+        "today",
+        "Open \u{201C}Today\u{201D} command",
+        &[
+            PresetStep::Open("/Applications/Obsidian.app"),
+            PresetStep::Delay(500),
+            PresetStep::Key(0x08, 0x13), // ⌘P
+            PresetStep::Delay(200),
+            PresetStep::Type("Today"),
+            PresetStep::Delay(150),
+            PresetStep::Key(0x00, 0x28), // Return
+        ],
+    ),
     shortcut("command_palette", "Open Command Palette", 0x08, 0x13),
     shortcut("quick_switcher", "Open Quick Switcher", 0x08, 0x12),
     shortcut("toggle_reading_view", "Toggle Reading View", 0x08, 0x08),
@@ -594,6 +686,12 @@ pub const APPLICATION_SHORTCUTS: &[ShortcutApplication] = &[
         shortcuts: PREVIEW_SHORTCUTS,
     },
     ShortcutApplication {
+        id: "outlook",
+        label: "Microsoft Outlook",
+        icon: "calendar-days",
+        shortcuts: OUTLOOK_SHORTCUTS,
+    },
+    ShortcutApplication {
         id: "notion",
         label: "Notion",
         icon: "simple:notion",
@@ -654,6 +752,7 @@ pub fn shortcut_applications_for_host() -> Vec<&'static ShortcutApplication> {
                         | "keynote"
                         | "preview"
                         | "music"
+                        | "outlook"
                 )
             } else {
                 true
@@ -673,6 +772,21 @@ const fn shortcut(
         label,
         mods,
         key,
+        steps: &[],
+    }
+}
+
+const fn sequence(
+    id: &'static str,
+    label: &'static str,
+    steps: &'static [PresetStep],
+) -> ShortcutPreset {
+    ShortcutPreset {
+        id,
+        label,
+        mods: 0,
+        key: 0,
+        steps,
     }
 }
 
@@ -688,6 +802,29 @@ pub fn shortcut_preset(application: &str, id: &str) -> Option<&'static ShortcutP
 }
 
 pub fn shortcut_chord_label(shortcut: &ShortcutPreset) -> String {
+    if shortcut.is_sequence() {
+        return shortcut
+            .steps
+            .iter()
+            .filter_map(|step| match *step {
+                PresetStep::Open(target) => Some(format!(
+                    "Open {}",
+                    Path::new(target)
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(target)
+                )),
+                PresetStep::Key(mods, key) => Some(format!(
+                    "{}{}",
+                    mods_label(shortcut_mods_for_host(mods)),
+                    keyboard_name(key).unwrap_or("?")
+                )),
+                PresetStep::Type(text) => Some(format!("\u{201C}{text}\u{201D}")),
+                PresetStep::Delay(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+    }
     let mods = mods_label(shortcut_mods_for_host(shortcut.mods));
     let key = keyboard_name(shortcut.key).unwrap_or("Unknown key");
     if mods.is_empty() {
@@ -891,6 +1028,7 @@ pub fn system_presets() -> &'static [MacOsPreset] {
 /// catalog IDs, leaving the existing mapping untouched.
 pub fn apply_application_shortcut(
     input: &mut InputConfig,
+    slot_index: usize,
     application: &str,
     shortcut_id: &str,
 ) -> bool {
@@ -901,8 +1039,15 @@ pub fn apply_application_shortcut(
         application: application.to_string(),
         shortcut: shortcut_id.to_string(),
     });
-    input.emitted = keyboard_slot(shortcut_mods_for_host(shortcut.mods), shortcut.key);
-    input.action = Action::None;
+    if shortcut.is_sequence() {
+        input.emitted = host_trigger(slot_index);
+        input.action = Action::Macro {
+            steps: preset_macro(shortcut.steps),
+        };
+    } else {
+        input.emitted = keyboard_slot(shortcut_mods_for_host(shortcut.mods), shortcut.key);
+        input.action = Action::None;
+    }
     true
 }
 
@@ -1006,7 +1151,7 @@ pub fn behavior_is_consistent(input: &InputConfig, slot_index: usize) -> bool {
         ControlBehavior::ApplicationShortcut {
             application,
             shortcut,
-        } => apply_application_shortcut(&mut expected, &application, &shortcut),
+        } => apply_application_shortcut(&mut expected, slot_index, &application, &shortcut),
         ControlBehavior::MacOs { command }
             if matches!(command, MacOsControl::Applications | MacOsControl::Sleep) =>
         {
@@ -1348,6 +1493,10 @@ mod tests {
             let mut ids = HashSet::new();
             let mut chords = HashSet::new();
             for preset in app.shortcuts {
+                if preset.is_sequence() {
+                    assert!(ids.insert(preset.id), "{}: duplicate id {}", app.id, preset.id);
+                    continue;
+                }
                 assert!(
                     ids.insert(preset.id),
                     "{}: duplicate shortcut id {}",
@@ -1510,10 +1659,29 @@ mod tests {
     }
 
     #[test]
+    fn sequence_preset_compiles_to_a_macro() {
+        let mut input = sample_input();
+        assert!(apply_application_shortcut(&mut input, 3, "slack", "search_you"));
+        assert!(behavior_is_consistent(&input, 3));
+        let Action::Macro { steps } = &input.action else {
+            panic!("expected a macro, got {:?}", input.action);
+        };
+        assert_eq!(
+            crate::actions::macro_preview(steps),
+            "Open Slack.app ⌘G you ⌘Enter"
+        );
+        assert_eq!(
+            shortcut_chord_label(shortcut_preset("slack", "search_you").unwrap()),
+            "Open Slack · ⌘G · \u{201C}you\u{201D} · ⌘Enter"
+        );
+    }
+
+    #[test]
     fn application_shortcut_compiles_to_one_saved_chord() {
         let mut input = sample_input();
         assert!(apply_application_shortcut(
             &mut input,
+            0,
             "vscode",
             "command_palette"
         ));

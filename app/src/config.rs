@@ -158,6 +158,11 @@ pub enum Action {
     AppSwitch {
         reverse: bool,
     },
+    /// Hold these modifiers (HID bitmask) down for as long as the control is
+    /// held, like pressing Shift itself.
+    HoldModifier {
+        mods: u8,
+    },
     /// Do nothing, even where the default profile binds this input.
     Disabled,
 }
@@ -921,6 +926,15 @@ pub struct AppConfig {
     /// the default profile.
     #[serde(default = "default_true")]
     pub auto_switch: bool,
+    /// Minutes without pad input before the lights dim (0 = never).
+    #[serde(default = "default_standby_minutes")]
+    pub standby_minutes: u16,
+}
+
+pub const DEFAULT_STANDBY_MINUTES: u16 = 1;
+
+fn default_standby_minutes() -> u16 {
+    DEFAULT_STANDBY_MINUTES
 }
 
 impl Default for AppConfig {
@@ -939,6 +953,7 @@ impl Default for AppConfig {
             led_ambient_pattern: LedPattern::Rainbow,
             activity_status_colors: ActivityStatusColors::default(),
             auto_switch: true,
+            standby_minutes: DEFAULT_STANDBY_MINUTES,
         }
     }
 }
@@ -1484,6 +1499,7 @@ fn migrate_legacy(legacy: LegacyConfig) -> AppConfig {
         led_ambient_pattern: LedPattern::Rainbow,
         activity_status_colors: ActivityStatusColors::default(),
         auto_switch: true,
+        standby_minutes: DEFAULT_STANDBY_MINUTES,
     }
 }
 
@@ -2319,6 +2335,7 @@ mod tests {
             led_ambient_pattern: LedPattern::Rainbow,
             activity_status_colors: ActivityStatusColors::default(),
             auto_switch: true,
+            standby_minutes: DEFAULT_STANDBY_MINUTES,
         };
         sanitize(&mut cfg);
         assert_eq!(cfg.active_profile, 0);

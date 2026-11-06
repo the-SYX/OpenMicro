@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
-use crate::config::{Action, MacroStep, MediaOp};
+use crate::config::{Action, MacroStep, MacroStepEntry, MediaOp};
 use crate::events;
 use crate::keycodes::{keyboard_name, mods_label};
 
@@ -52,6 +52,11 @@ pub fn execute(action: &Action) {
     thread::spawn(move || run_blocking(&action));
 }
 
+/// Run one action on the caller's thread, finished before returning.
+pub fn execute_now(action: &Action) {
+    run_blocking(action);
+}
+
 /// The blocking half of `execute`; only ever called on a worker thread.
 fn run_blocking(action: &Action) {
     match action {
@@ -69,7 +74,8 @@ fn run_blocking(action: &Action) {
         Action::Media { op } => media_op(*op),
         Action::AppSettings => events::post(OpenAppSettings),
         Action::AppSwitch { reverse } => app_switch(*reverse),
-        Action::Disabled => {}
+        // Press and release are separate events; see `hold_modifiers`.
+        Action::HoldModifier { .. } | Action::Disabled => {}
     }
 }
 
@@ -247,6 +253,135 @@ fn app_switch(reverse: bool) {
         }
         let _ = enigo.key(Key::Meta, Direction::Release);
     });
+}
+
+/// Press (`down`) or release the modifiers in `mods`, on the caller's thread
+/// so a press and its release can't race each other.
+pub fn hold_modifiers(mods: u8, down: bool) {
+    // Synthesized modifier presses don't reach real mouse clicks, so an event
+    // tap also adds them to every mouse and key event while held.
+    #[cfg(target_os = "macos")]
+    held_flags_tap::set(if down { mods } else { 0 });
+    let Some(mut enigo) = new_enigo() else {
+        return;
+    };
+    let direction = if down { Direction::Press } else { Direction::Release };
+    for &(bit, key) in &HID_MOD_KEYS {
+        if mods & bit != 0 {
+            if let Err(e) = enigo.key(key, direction) {
+                eprintln!("actions: held modifier {direction:?} failed: {e}");
+            }
+        }
+    }
+}
+
+/// A session event tap that ORs the held modifiers into mouse and key events.
+#[cfg(target_os = "macos")]
+mod held_flags_tap {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Once;
+
+    type Ref = *mut c_void;
+    type TapCallback = extern "C" fn(Ref, u32, Ref, Ref) -> Ref;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGEventTapCreate(
+            tap: u32,
+            place: u32,
+            options: u32,
+            events: u64,
+            callback: TapCallback,
+            user_info: Ref,
+        ) -> Ref;
+        fn CGEventTapEnable(tap: Ref, enable: bool);
+        fn CGEventGetFlags(event: Ref) -> u64;
+        fn CGEventSetFlags(event: Ref, flags: u64);
+        fn CGEventGetIntegerValueField(event: Ref, field: u32) -> i64;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFRunLoopCommonModes: Ref;
+        fn CFMachPortCreateRunLoopSource(alloc: Ref, port: Ref, order: isize) -> Ref;
+        fn CFRunLoopGetCurrent() -> Ref;
+        fn CFRunLoopAddSource(run_loop: Ref, source: Ref, mode: Ref);
+        fn CFRunLoopRun();
+    }
+
+    const SESSION_TAP: u32 = 1;
+    const HEAD_INSERT: u32 = 0;
+    const DEFAULT_OPTIONS: u32 = 0;
+    const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+    const TAP_DISABLED_BY_USER: u32 = 0xFFFF_FFFF;
+    const SOURCE_UNIX_PROCESS_ID: u32 = 41;
+    /// Mouse buttons, drags, moves, scrolls and keys.
+    const EVENTS: [u32; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 25, 26, 27];
+
+    static FLAGS: AtomicU64 = AtomicU64::new(0);
+    static TAP: AtomicU64 = AtomicU64::new(0);
+    static START: Once = Once::new();
+
+    /// Hold `mods` (HID bitmask) on every event from now on; 0 clears.
+    pub fn set(mods: u8) {
+        let mut flags = 0;
+        for (bit, flag) in [(1, 0x40000), (2, 0x20000), (4, 0x80000), (8, 0x100000)] {
+            if mods & bit != 0 {
+                flags |= flag;
+            }
+        }
+        FLAGS.store(flags, Ordering::SeqCst);
+        if flags != 0 {
+            START.call_once(|| {
+                std::thread::spawn(run);
+            });
+        }
+    }
+
+    extern "C" fn callback(_proxy: Ref, kind: u32, event: Ref, _info: Ref) -> Ref {
+        if kind == TAP_DISABLED_BY_TIMEOUT || kind == TAP_DISABLED_BY_USER {
+            let tap = TAP.load(Ordering::SeqCst) as Ref;
+            if !tap.is_null() {
+                unsafe { CGEventTapEnable(tap, true) };
+            }
+            return event;
+        }
+        let held = FLAGS.load(Ordering::Relaxed);
+        // Our own keystrokes carry exactly the modifiers they were sent with;
+        // the tap runs behind the sender, so a chord sent with the hold
+        // briefly lifted would otherwise pick it up again.
+        let own = || unsafe {
+            CGEventGetIntegerValueField(event, SOURCE_UNIX_PROCESS_ID)
+                == i64::from(std::process::id())
+        };
+        if held != 0 && !own() {
+            unsafe { CGEventSetFlags(event, CGEventGetFlags(event) | held) };
+        }
+        event
+    }
+
+    fn run() {
+        let mask = EVENTS.iter().fold(0u64, |mask, kind| mask | 1 << kind);
+        unsafe {
+            let tap = CGEventTapCreate(
+                SESSION_TAP,
+                HEAD_INSERT,
+                DEFAULT_OPTIONS,
+                mask,
+                callback,
+                std::ptr::null_mut(),
+            );
+            if tap.is_null() {
+                eprintln!("actions: modifier event tap unavailable; is Accessibility granted?");
+                return;
+            }
+            TAP.store(tap as u64, Ordering::SeqCst);
+            let source = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+            CGEventTapEnable(tap, true);
+            CFRunLoopRun();
+        }
+    }
 }
 
 /// Pick the app highlighted in an open switcher now instead of waiting for
@@ -449,7 +584,10 @@ pub fn open_permission_settings() {
 /// through the OS launcher or stay inside the app.
 pub fn needs_permission(action: &Action) -> bool {
     match action {
-        Action::Keystroke { .. } | Action::Media { .. } | Action::AppSwitch { .. } => true,
+        Action::Keystroke { .. }
+        | Action::Media { .. }
+        | Action::AppSwitch { .. }
+        | Action::HoldModifier { .. } => true,
         Action::Macro { steps } => steps.iter().any(|e| {
             e.enabled
                 && matches!(
@@ -482,6 +620,7 @@ pub fn describe(action: &Action) -> String {
                 keyboard_name(*key).unwrap_or("—")
             )
         }
+        Action::Macro { steps } if !macro_preview(steps).is_empty() => macro_preview(steps),
         Action::Macro { steps } if steps.len() == 1 => "Macro · 1 step".to_string(),
         Action::Macro { steps } => format!("Macro · {} steps", steps.len()),
         Action::Run { command } => format!("Run · {}", short_command(command)),
@@ -490,7 +629,80 @@ pub fn describe(action: &Action) -> String {
         Action::AppSettings => "App settings".to_string(),
         Action::AppSwitch { reverse: false } => "Next app".to_string(),
         Action::AppSwitch { reverse: true } => "Previous app".to_string(),
+        Action::HoldModifier { mods } => format!("Hold {}", mods_label(*mods)),
         Action::Disabled => "Do nothing".to_string(),
+    }
+}
+
+/// What a macro does, as text: typed characters run together and other
+/// steps by name, delays skipped — "/resume ⏎", "⌘C ⌘V". Empty when the
+/// macro has nothing visible to show.
+pub fn macro_preview(steps: &[MacroStepEntry]) -> String {
+    let mut out = String::new();
+    let mut typing = false;
+    for entry in steps.iter().filter(|e| e.enabled) {
+        let (piece, typed) = match &entry.step {
+            MacroStep::Keystroke { mods, key } => match typed_char(*mods, *key) {
+                Some(c) => (c.to_string(), true),
+                None if *mods == 0 && *key == 0x28 => ("⏎".to_string(), false),
+                None => (
+                    format!("{}{}", mods_label(*mods), keyboard_name(*key).unwrap_or("?")),
+                    false,
+                ),
+            },
+            MacroStep::Delay { .. } => continue,
+            MacroStep::Run { command } => (format!("Run {}", short_command(command)), false),
+            MacroStep::Open { target } => (format!("Open {}", short_target(target)), false),
+            MacroStep::Media { op } => (media_label(*op).to_string(), false),
+        };
+        if !out.is_empty() && !(typed && typing) {
+            out.push(' ');
+        }
+        out.push_str(&piece);
+        typing = typed;
+    }
+    out
+}
+
+/// The plain or shifted key that types `c` on a US layout.
+pub fn key_for_char(c: char) -> Option<(u8, u16)> {
+    [0u8, 0x02]
+        .into_iter()
+        .flat_map(|mods| (0x04u16..=0x38).map(move |key| (mods, key)))
+        .find(|&(mods, key)| typed_char(mods, key) == Some(c))
+}
+
+/// The character a plain or shifted key types on a US layout.
+fn typed_char(mods: u8, key: u16) -> Option<char> {
+    const SHIFT: u8 = 0x22;
+    if mods & !SHIFT != 0 {
+        return None;
+    }
+    let shift = mods & SHIFT != 0;
+    let pair = |plain: char, shifted: char| Some(if shift { shifted } else { plain });
+    match key {
+        0x04..=0x1D => {
+            let c = (b'a' + (key - 0x04) as u8) as char;
+            Some(if shift { c.to_ascii_uppercase() } else { c })
+        }
+        0x1E..=0x26 => pair(
+            (b'1' + (key - 0x1E) as u8) as char,
+            b"!@#$%^&*("[(key - 0x1E) as usize] as char,
+        ),
+        0x27 => pair('0', ')'),
+        0x2C if !shift => Some(' '),
+        0x2D => pair('-', '_'),
+        0x2E => pair('=', '+'),
+        0x2F => pair('[', '{'),
+        0x30 => pair(']', '}'),
+        0x31 => pair('\\', '|'),
+        0x33 => pair(';', ':'),
+        0x34 => pair('\'', '"'),
+        0x35 => pair('`', '~'),
+        0x36 => pair(',', '<'),
+        0x37 => pair('.', '>'),
+        0x38 => pair('/', '?'),
+        _ => None,
     }
 }
 
@@ -617,6 +829,25 @@ mod tests {
                 steps: vec![MacroStep::Delay { ms: 1 }.into()]
             }),
             "Macro · 1 step"
+        );
+    }
+
+    #[test]
+    fn macro_preview_reads_as_typed_text() {
+        let key = |mods, key| MacroStepEntry::from(MacroStep::Keystroke { mods, key });
+        let steps = vec![
+            key(0x02, 0x38), // ⇧/ = ?
+            key(0, 0x38),    // /
+            key(0, 0x15),    // r
+            key(0, 0x2C),    // space
+            key(0x02, 0x04), // A
+            MacroStep::Delay { ms: 150 }.into(),
+            key(0, 0x28), // Enter
+        ];
+        assert_eq!(macro_preview(&steps), "?/r A ⏎");
+        assert_eq!(
+            describe(&Action::Macro { steps }),
+            "?/r A ⏎"
         );
     }
 }

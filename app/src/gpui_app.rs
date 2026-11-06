@@ -318,6 +318,39 @@ fn resolve_theme(setting: ThemeSetting, appearance: WindowAppearance) -> pixel::
     }
 }
 
+/// What an input does, for the inspector summary: the action, else the key
+/// it emits, else "Nothing".
+fn binding_text(input: &InputConfig) -> String {
+    match &input.action {
+        Action::None => match input.emitted.kind {
+            SlotKind::None => "Nothing".into(),
+            _ => keycodes::slot_label(&input.emitted),
+        },
+        action => actions::describe(action),
+    }
+}
+
+/// Standby choices in minutes; 0 = never.
+const STANDBY_CHOICES: [u16; 9] = [0, 1, 2, 5, 10, 15, 20, 30, 60];
+const MIN_TILE: f32 = 96.;
+const MAX_TILE: f32 = 168.;
+const INSPECTOR_W: f32 = 360.;
+
+/// Board width for a tile size: four tiles, three 8 px gaps, 16 px padding.
+fn board_width(tile: f32) -> f32 {
+    tile * 4. + 8. * 3. + 32.
+}
+
+/// Tile size that lets the 4x4 board fill the space left of the inspector.
+fn device_tile_size(window: &Window) -> f32 {
+    let viewport = window.viewport_size();
+    let width = f32::from(viewport.width) - INSPECTOR_W - 36.;
+    // Header, banners, outer padding and the hold-layer rail.
+    let height = f32::from(viewport.height) - 150.;
+    let fit = |space: f32| (space - 8. * 3. - 32.) / 4.;
+    fit(width).min(fit(height)).clamp(MIN_TILE, MAX_TILE).floor()
+}
+
 fn cell_for_slot(slot: usize) -> usize {
     match slot {
         0..=12 => slot,
@@ -416,6 +449,7 @@ fn action_kind_label(action: &Action) -> &'static str {
         Action::Media { .. } => tr("act_media"),
         Action::AppSettings => tr("act_app_settings"),
         Action::AppSwitch { .. } => "App switcher",
+        Action::HoldModifier { .. } => "Hold modifier",
         Action::Disabled => tr("act_disabled"),
     }
 }
@@ -1684,6 +1718,7 @@ impl OpenMicro {
         };
         if behaviors::apply_application_shortcut(
             &mut self.host.active_profile_mut().inputs[slot],
+            slot,
             application,
             shortcut,
         ) {
@@ -1823,7 +1858,7 @@ impl OpenMicro {
         };
         let current = match self.host.active_profile().inputs[slot].action {
             Action::None | Action::Disabled => 0,
-            Action::Keystroke { .. } | Action::AppSwitch { .. } => 1,
+            Action::Keystroke { .. } | Action::AppSwitch { .. } | Action::HoldModifier { .. } => 1,
             Action::Macro { .. } => 2,
             Action::Run { .. } => 3,
             Action::Open { .. } => 4,
@@ -2356,6 +2391,27 @@ impl OpenMicro {
             )
     }
 
+    fn cycle_standby(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let current = self.host.config.standby_minutes;
+        let index = STANDBY_CHOICES.iter().position(|m| *m == current).unwrap_or(1) as isize;
+        let next = (index + delta).rem_euclid(STANDBY_CHOICES.len() as isize) as usize;
+        self.host.config.standby_minutes = STANDBY_CHOICES[next];
+        if let Some(tx) = &self.host.device_tx {
+            let _ = tx.send(DeviceCmd::SetStandby {
+                minutes: self.host.config.standby_minutes,
+            });
+        }
+        self.commit(false, cx);
+    }
+
+    fn standby_label(&self) -> String {
+        match self.host.config.standby_minutes {
+            0 => tr("standby_never").to_string(),
+            1 => "1 minute".to_string(),
+            m => format!("{m} minutes"),
+        }
+    }
+
     fn adjust_brightness(&mut self, delta: i16, cx: &mut Context<Self>) {
         let current = self.host.config.led_brightness as i16;
         self.host.config.led_brightness = (current + delta).clamp(0, 255) as u8;
@@ -2729,10 +2785,21 @@ impl OpenMicro {
         let view = cx.entity();
         let codex_view = view.clone();
         let (connection, connection_color) = if self.host.connected {
-            (tr("connected"), pixel::success_color())
+            let label = match self.host.battery {
+                Some((percent, charging)) => format!(
+                    "{} · battery {percent}%{}",
+                    tr("connected"),
+                    if charging { " (charging)" } else { "" }
+                ),
+                None => tr("connected").to_string(),
+            };
+            (label.into(), pixel::success_color())
         } else {
-            (tr("editing_offline"), pixel::dim_text_color())
+            (SharedString::from(tr("editing_offline")), pixel::dim_text_color())
         };
+        // The stock pad has no device modes, so the switcher only shows for
+        // OpenMicro firmware.
+        let show_mode = self.host.device_mode.is_some() || self.host.mode_switch_pending;
 
         let content = div()
             .w_full()
@@ -2764,61 +2831,64 @@ impl OpenMicro {
                             .child(connection),
                     ),
             )
-            .child(
-                div()
-                    .text_size(px(9.))
-                    .font_semibold()
-                    .text_color(pixel::dim_text_color())
-                    .child(tr("device_mode")),
-            )
-            .child(
-                chrome_icon_button("chevron-left")
-                    .id("mode-previous")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if !this.host.mode_switch_pending {
-                            if let Some(mode) = this.host.device_mode {
-                                let next = match mode {
-                                    DeviceMode::OpenMicro => DeviceMode::Codex,
-                                    DeviceMode::Codex => DeviceMode::OpenMicro,
-                                };
-                                this.host.set_device_mode(next);
-                                cx.notify();
-                            }
-                        }
-                    })),
-            )
-            .child(
-                div()
-                    .w(px(88.))
-                    .h(px(26.))
-                    .min_w(px(0.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .truncate()
-                    .text_size(px(12.))
-                    .font_semibold()
-                    .text_color(pixel::text_color())
-                    .child(device_mode),
-            )
-            .child(
-                chrome_icon_button("chevron-right")
-                    .id("mode-next")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if !this.host.mode_switch_pending {
-                            if let Some(mode) = this.host.device_mode {
-                                let next = match mode {
-                                    DeviceMode::OpenMicro => DeviceMode::Codex,
-                                    DeviceMode::Codex => DeviceMode::OpenMicro,
-                                };
-                                this.host.set_device_mode(next);
-                                cx.notify();
-                            }
-                        }
-                    })),
-            )
-            .child(div().w(px(1.)).h(px(18.)).bg(pixel::border_color()))
+            .when(show_mode, |header| {
+                header
+                    .child(
+                        div()
+                            .text_size(px(9.))
+                            .font_semibold()
+                            .text_color(pixel::dim_text_color())
+                            .child(tr("device_mode")),
+                    )
+                    .child(
+                        chrome_icon_button("chevron-left")
+                            .id("mode-previous")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.host.mode_switch_pending {
+                                    if let Some(mode) = this.host.device_mode {
+                                        let next = match mode {
+                                            DeviceMode::OpenMicro => DeviceMode::Codex,
+                                            DeviceMode::Codex => DeviceMode::OpenMicro,
+                                        };
+                                        this.host.set_device_mode(next);
+                                        cx.notify();
+                                    }
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(px(88.))
+                            .h(px(26.))
+                            .min_w(px(0.))
+                            .px(px(8.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .truncate()
+                            .text_size(px(12.))
+                            .font_semibold()
+                            .text_color(pixel::text_color())
+                            .child(device_mode),
+                    )
+                    .child(
+                        chrome_icon_button("chevron-right")
+                            .id("mode-next")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.host.mode_switch_pending {
+                                    if let Some(mode) = this.host.device_mode {
+                                        let next = match mode {
+                                            DeviceMode::OpenMicro => DeviceMode::Codex,
+                                            DeviceMode::Codex => DeviceMode::OpenMicro,
+                                        };
+                                        this.host.set_device_mode(next);
+                                        cx.notify();
+                                    }
+                                }
+                            })),
+                    )
+                    .child(div().w(px(1.)).h(px(18.)).bg(pixel::border_color()))
+            })
             .child(
                 div()
                     .text_size(px(9.))
@@ -3284,7 +3354,7 @@ impl OpenMicro {
         banners
     }
 
-    fn render_device_cell(&self, cell: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_device_cell(&self, cell: usize, size: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let slots = slots_for_cell(cell);
         let primary = slots[0];
         let native_codex = self.host.device_mode == Some(DeviceMode::Codex)
@@ -3323,7 +3393,11 @@ impl OpenMicro {
             });
         let live = self.host.pressed_cells[cell];
         let icon = configured_icon_visual(
-            if native_codex { "" } else { &input.icon },
+            if native_codex {
+                ""
+            } else {
+                self.printed_cap_icon(primary).unwrap_or(&input.icon)
+            },
             15.,
             if selected {
                 pixel::accent_color()
@@ -3338,7 +3412,7 @@ impl OpenMicro {
                 if native_codex || input.label.trim().is_empty() {
                     format!("KEY {:02}", cell + 1)
                 } else {
-                    short_text(&input.label, 12)
+                    short_text(&input.label, 24)
                 }
             }
             CELL_ENCODER => tr("dial_rotator").to_string(),
@@ -3379,7 +3453,11 @@ impl OpenMicro {
         controls::keycap_device_cell(
             label,
             icon,
-            short_text(&detail, 18),
+            short_text(&detail, 40),
+            // The user's button numbers run row by row, 1-13.
+            (cell < KEY_SLOTS).then_some(cell + 1),
+            size,
+            cell >= KEY_SLOTS,
             CellVisual {
                 selected,
                 live,
@@ -3391,9 +3469,10 @@ impl OpenMicro {
         .on_click(cx.listener(move |this, _, window, cx| this.select_slot(primary, window, cx)))
     }
 
-    fn render_device_map(&self, cx: &mut Context<Self>) -> Div {
+    fn render_device_map(&self, tile: f32, cx: &mut Context<Self>) -> Div {
+        let board_w = board_width(tile);
         let board = div()
-            .w(px(440.))
+            .w(px(board_w))
             .flex_none()
             .flex()
             .flex_col()
@@ -3406,46 +3485,46 @@ impl OpenMicro {
                     .w_full()
                     .flex()
                     .gap(px(8.))
-                    .child(self.render_device_cell(CELL_ENCODER, cx))
-                    .child(self.render_device_cell(0, cx))
-                    .child(self.render_device_cell(1, cx))
-                    .child(self.render_device_cell(CELL_JOYSTICK, cx)),
+                    .child(self.render_device_cell(CELL_ENCODER, tile, cx))
+                    .child(self.render_device_cell(0, tile, cx))
+                    .child(self.render_device_cell(1, tile, cx))
+                    .child(self.render_device_cell(CELL_JOYSTICK, tile, cx)),
             )
             .child(
                 div()
                     .w_full()
                     .flex()
                     .gap(px(8.))
-                    .child(self.render_device_cell(2, cx))
-                    .child(self.render_device_cell(3, cx))
-                    .child(self.render_device_cell(4, cx))
-                    .child(self.render_device_cell(5, cx)),
+                    .child(self.render_device_cell(2, tile, cx))
+                    .child(self.render_device_cell(3, tile, cx))
+                    .child(self.render_device_cell(4, tile, cx))
+                    .child(self.render_device_cell(5, tile, cx)),
             )
             .child(
                 div()
                     .w_full()
                     .flex()
                     .gap(px(8.))
-                    .child(self.render_device_cell(6, cx))
-                    .child(self.render_device_cell(7, cx))
-                    .child(self.render_device_cell(8, cx))
-                    .child(self.render_device_cell(9, cx)),
+                    .child(self.render_device_cell(6, tile, cx))
+                    .child(self.render_device_cell(7, tile, cx))
+                    .child(self.render_device_cell(8, tile, cx))
+                    .child(self.render_device_cell(9, tile, cx)),
             )
             .child(
                 div()
                     .w_full()
                     .flex()
                     .gap(px(8.))
-                    .child(self.render_device_cell(CELL_TOUCH, cx))
-                    .child(self.render_device_cell(10, cx))
-                    .child(self.render_device_cell(11, cx))
-                    .child(self.render_device_cell(12, cx)),
+                    .child(self.render_device_cell(CELL_TOUCH, tile, cx))
+                    .child(self.render_device_cell(10, tile, cx))
+                    .child(self.render_device_cell(11, tile, cx))
+                    .child(self.render_device_cell(12, tile, cx)),
             );
 
         div()
             .h_full()
             .flex_1()
-            .min_w(px(440.))
+            .min_w(px(board_width(MIN_TILE)))
             .min_h(px(0.))
             .overflow_hidden()
             .flex()
@@ -3455,7 +3534,7 @@ impl OpenMicro {
             .gap(px(12.))
             .children(self.host.editing_layer.map(|trigger| {
                 div()
-                    .w(px(440.))
+                    .w(px(board_w))
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -3587,49 +3666,76 @@ impl OpenMicro {
         row
     }
 
+    /// Icon printed on a stock Codex Micro keycap (keys 7-13); the app shows
+    /// it instead of a configurable icon. The six translucent keys are blank.
+    fn printed_cap_icon(&self, slot: usize) -> Option<&'static str> {
+        const CAPS: [&str; 7] = [
+            "square-pen",
+            "zap",
+            "split",
+            "cloud",
+            "mic",
+            "circle-check",
+            "circle-x",
+        ];
+        (self.host.device_mode.is_none() && (6..KEY_SLOTS).contains(&slot))
+            .then(|| CAPS[slot - 6])
+    }
+
     fn render_simple_editor(&self, slot: usize, cx: &mut Context<Self>) -> Div {
         let input = &self.host.active_profile().inputs[slot];
         let behavior_label = Self::simple_behavior_label(input, slot);
-        let icon_name = configured_icon_label(&input.icon);
-        let icon_preview = configured_icon_visual(&input.icon, 17., pixel::accent_color())
-            .unwrap_or_else(|| lucide_icon_visual("image-off", 17., pixel::muted_text_color()));
+        let printed = self.printed_cap_icon(slot);
+        let icon_name = match printed {
+            Some(_) => "Printed on the keycap".to_string(),
+            None => configured_icon_label(&input.icon),
+        };
+        let icon_preview =
+            configured_icon_visual(printed.unwrap_or(&input.icon), 17., pixel::accent_color())
+                .unwrap_or_else(|| {
+                    lucide_icon_visual("image-off", 17., pixel::muted_text_color())
+                });
+        let icon_card = if printed.is_some() {
+            selection_card(icon_preview, icon_name, None).into_any_element()
+        } else {
+            selection_card(icon_preview, icon_name, None)
+                .id("simple-change-icon")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let selected_icon = this
+                        .host
+                        .selected_slot
+                        .and_then(|slot| this.host.active_profile().inputs.get(slot))
+                        .map(|input| input.icon.clone())
+                        .unwrap_or_default();
+                    this.icon_library =
+                        if crate::simple_icons::slug_from_storage(&selected_icon).is_some() {
+                            IconLibrary::Simple
+                        } else {
+                            IconLibrary::Lucide
+                        };
+                    this.icon_query.clear();
+                    this.icon_page = icon_picker_page(&selected_icon);
+                    this.icon_scroll.set_offset(point(px(0.), px(0.)));
+                    this.sheet = Sheet::Icons;
+                    this.sync_inputs(window, cx);
+                    let placeholder = match this.icon_library {
+                        IconLibrary::Lucide => tr("icon_search_placeholder"),
+                        IconLibrary::Simple => tr("brand_search_placeholder"),
+                    };
+                    this.search_input.update(cx, |input, cx| {
+                        input.set_placeholder(placeholder, window, cx)
+                    });
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
         let mut editor = div()
             .w_full()
             .flex()
             .flex_col()
             .gap(px(12.))
             .child(Input::new(&self.label_input).w_full())
-            .child(
-                selection_card(icon_preview, icon_name, None)
-                    .id("simple-change-icon")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let selected_icon = this
-                            .host
-                            .selected_slot
-                            .and_then(|slot| this.host.active_profile().inputs.get(slot))
-                            .map(|input| input.icon.clone())
-                            .unwrap_or_default();
-                        this.icon_library =
-                            if crate::simple_icons::slug_from_storage(&selected_icon).is_some() {
-                                IconLibrary::Simple
-                            } else {
-                                IconLibrary::Lucide
-                            };
-                        this.icon_query.clear();
-                        this.icon_page = icon_picker_page(&selected_icon);
-                        this.icon_scroll.set_offset(point(px(0.), px(0.)));
-                        this.sheet = Sheet::Icons;
-                        this.sync_inputs(window, cx);
-                        let placeholder = match this.icon_library {
-                            IconLibrary::Lucide => tr("icon_search_placeholder"),
-                            IconLibrary::Simple => tr("brand_search_placeholder"),
-                        };
-                        this.search_input.update(cx, |input, cx| {
-                            input.set_placeholder(placeholder, window, cx)
-                        });
-                        cx.notify();
-                    })),
-            )
+            .child(icon_card)
             .child(controls::cycle_control(
                 behavior_label,
                 ("simple-behavior", 0usize).into(),
@@ -4135,6 +4241,13 @@ impl OpenMicro {
                     BadgeTone::Info,
                 ));
             }
+            Action::HoldModifier { mods } => {
+                editor = editor.child(controls::status_rail(
+                    "HOLD",
+                    format!("Holds {} down while this control is held.", keycodes::mods_label(*mods)),
+                    BadgeTone::Info,
+                ));
+            }
             Action::Disabled => {
                 editor = editor.child(controls::status_rail(
                     "OFF",
@@ -4300,6 +4413,101 @@ impl OpenMicro {
         editor
     }
 
+    /// What the selected control does right now, in plain words, above the
+    /// editors: one line per input of the control.
+    fn render_binding_summary(&self, cell: usize) -> Div {
+        let profile = self.host.effective_profile();
+        let rows: Vec<(String, String)> = match cell {
+            CELL_ENCODER => vec![
+                ("Turn right".into(), binding_text(&profile.inputs[SLOT_ENC_CW])),
+                ("Turn left".into(), binding_text(&profile.inputs[SLOT_ENC_CCW])),
+                ("Press".into(), binding_text(&profile.inputs[SLOT_ENC_PRESS])),
+            ],
+            CELL_JOYSTICK => [
+                ("Up", SLOT_JOY_UP),
+                ("Down", SLOT_JOY_DOWN),
+                ("Left", SLOT_JOY_LEFT),
+                ("Right", SLOT_JOY_RIGHT),
+                ("Press", SLOT_JOY_PRESS),
+            ]
+            .into_iter()
+            .map(|(name, slot)| (name.into(), binding_text(&profile.inputs[slot])))
+            .collect(),
+            CELL_TOUCH => vec![("Tap".into(), binding_text(&profile.inputs[SLOT_TOUCH_TAP]))],
+            _ => vec![("Press".into(), binding_text(&profile.inputs[cell]))],
+        };
+        let title = match cell {
+            0..=12 => {
+                let label = profile.inputs[cell].label.trim();
+                if label.is_empty() {
+                    format!("KEY {}", cell + 1)
+                } else {
+                    format!("KEY {} · {}", cell + 1, label.to_uppercase())
+                }
+            }
+            CELL_ENCODER => tr("dial_rotator").to_string(),
+            CELL_JOYSTICK => tr("dial_joystick").to_string(),
+            _ => tr("dial_touch").to_string(),
+        };
+        let inherited = slots_for_cell(cell)
+            .iter()
+            .any(|slot| self.host.inherited_input(*slot).is_some());
+
+        div()
+            .mx(px(16.))
+            .mb(px(12.))
+            .p(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .bg(pixel::raised_color())
+            .rounded(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family("Monaco")
+                            .font_semibold()
+                            .text_size(px(11.))
+                            .text_color(pixel::accent_color())
+                            .child(title),
+                    )
+                    .when(inherited, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(pixel::dim_text_color())
+                                .child("↳ from Default profile"),
+                        )
+                    }),
+            )
+            .children(rows.into_iter().map(|(name, what)| {
+                div()
+                    .flex()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .w(px(72.))
+                            .flex_shrink_0()
+                            .text_size(px(12.))
+                            .text_color(pixel::muted_text_color())
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(13.))
+                            .text_color(pixel::text_color())
+                            .child(what),
+                    )
+            }))
+    }
+
     fn render_inspector(&self, cx: &mut Context<Self>) -> Div {
         let Some(slot) = self.host.selected_slot else {
             return div()
@@ -4330,6 +4538,7 @@ impl OpenMicro {
                 ),
             ))
         });
+        let summary = self.render_binding_summary(cell);
         let body = if cell == CELL_ENCODER {
             self.render_rotator_editor(cx)
         } else if cell == CELL_JOYSTICK {
@@ -4354,6 +4563,7 @@ impl OpenMicro {
                     .py(px(8.))
                     .track_scroll(&self.inspector_scroll)
                     .overflow_y_scroll()
+                    .child(summary)
                     .children(source)
                     .child(body),
             )
@@ -4452,6 +4662,17 @@ impl OpenMicro {
                     ("settings-brightness", 1usize).into(),
                     cx.listener(|this, _, _, cx| this.adjust_brightness(-13, cx)),
                     cx.listener(|this, _, _, cx| this.adjust_brightness(13, cx)),
+                ),
+            ))
+            .child(inspector_field(
+                tr("standby_after").to_uppercase(),
+                tr("standby_note"),
+                controls::cycle_control(
+                    self.standby_label(),
+                    ("settings-standby", 0usize).into(),
+                    ("settings-standby", 1usize).into(),
+                    cx.listener(|this, _, _, cx| this.cycle_standby(-1, cx)),
+                    cx.listener(|this, _, _, cx| this.cycle_standby(1, cx)),
                 ),
             ))
             .child(inspector_field(
@@ -6051,7 +6272,7 @@ impl Render for OpenMicro {
                     .items_start()
                     .gap(px(12.))
                     .overflow_hidden()
-                    .child(self.render_device_map(cx))
+                    .child(self.render_device_map(device_tile_size(window), cx))
                     .child(self.render_inspector(cx)),
             )
             .when(self.recording != RecordTarget::None, |root| {

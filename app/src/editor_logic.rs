@@ -117,7 +117,7 @@ pub fn apply_simple_behavior_kind(
                 shortcut,
             }) = input.behavior.clone()
             {
-                if behaviors::apply_application_shortcut(input, &application, &shortcut) {
+                if behaviors::apply_application_shortcut(input, slot_index, &application, &shortcut) {
                     return true;
                 }
             }
@@ -129,7 +129,7 @@ pub fn apply_simple_behavior_kind(
             let Some(shortcut) = application.shortcuts.first() else {
                 return false;
             };
-            behaviors::apply_application_shortcut(input, application.id, shortcut.id)
+            behaviors::apply_application_shortcut(input, slot_index, application.id, shortcut.id)
         }
         SimpleBehaviorKind::MacOs => {
             let command = match input.behavior.as_ref() {
@@ -204,6 +204,7 @@ pub fn selected_shortcut_preset(input: &InputConfig) -> Option<&'static Shortcut
 /// first preset, matching the previous editor's behavior.
 pub fn cycle_shortcut_application(
     input: &mut InputConfig,
+    slot_index: usize,
     direction: CycleDirection,
 ) -> Option<&'static ShortcutApplication> {
     let applications = behaviors::shortcut_applications_for_host();
@@ -215,7 +216,7 @@ pub fn cycle_shortcut_application(
     let index = cycle_index(applications.len(), current, direction)?;
     let application = applications[index];
     let shortcut = application.shortcuts.first()?;
-    if behaviors::apply_application_shortcut(input, application.id, shortcut.id) {
+    if behaviors::apply_application_shortcut(input, slot_index, application.id, shortcut.id) {
         Some(application)
     } else {
         None
@@ -225,6 +226,7 @@ pub fn cycle_shortcut_application(
 /// Cycle within the selected application's shortcut presets.
 pub fn cycle_shortcut_preset(
     input: &mut InputConfig,
+    slot_index: usize,
     direction: CycleDirection,
 ) -> Option<&'static ShortcutPreset> {
     let applications = behaviors::shortcut_applications_for_host();
@@ -239,7 +241,7 @@ pub fn cycle_shortcut_preset(
     });
     let index = cycle_index(application.shortcuts.len(), current, direction)?;
     let shortcut = &application.shortcuts[index];
-    if behaviors::apply_application_shortcut(input, application.id, shortcut.id) {
+    if behaviors::apply_application_shortcut(input, slot_index, application.id, shortcut.id) {
         Some(shortcut)
     } else {
         None
@@ -419,7 +421,9 @@ impl ActionKind {
 pub const fn classify_action(action: &Action) -> ActionKind {
     match action {
         Action::None | Action::Disabled => ActionKind::None,
-        Action::Keystroke { .. } | Action::AppSwitch { .. } => ActionKind::Keystroke,
+        Action::Keystroke { .. } | Action::AppSwitch { .. } | Action::HoldModifier { .. } => {
+            ActionKind::Keystroke
+        }
         Action::Macro { .. } => ActionKind::Macro,
         Action::Run { .. } => ActionKind::Run,
         Action::Open { .. } => ActionKind::Open,
@@ -802,11 +806,12 @@ mod tests {
         let last_shortcut = last_app.shortcuts.last().unwrap();
         assert!(behaviors::apply_application_shortcut(
             &mut input,
+            0,
             last_app.id,
             last_shortcut.id
         ));
 
-        let app = cycle_shortcut_application(&mut input, CycleDirection::Next).unwrap();
+        let app = cycle_shortcut_application(&mut input, 0, CycleDirection::Next).unwrap();
         assert_eq!(app.id, applications[0].id);
         assert_eq!(
             selected_shortcut_preset(&input).unwrap().id,
@@ -816,11 +821,11 @@ mod tests {
         let app = applications[0];
         let last = app.shortcuts.last().unwrap();
         assert!(behaviors::apply_application_shortcut(
-            &mut input, app.id, last.id
+            &mut input, 0, app.id, last.id
         ));
-        let preset = cycle_shortcut_preset(&mut input, CycleDirection::Next).unwrap();
+        let preset = cycle_shortcut_preset(&mut input, 0, CycleDirection::Next).unwrap();
         assert_eq!(preset.id, app.shortcuts[0].id);
-        let preset = cycle_shortcut_preset(&mut input, CycleDirection::Previous).unwrap();
+        let preset = cycle_shortcut_preset(&mut input, 0, CycleDirection::Previous).unwrap();
         assert_eq!(preset.id, last.id);
     }
 

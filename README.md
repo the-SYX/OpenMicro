@@ -16,7 +16,8 @@ Upstream expects its own firmware with an on-device keymap. The stock pad has no
 ### Profiles
 - **Per-app switching:** link profiles to apps; the active profile follows the front app, with one Default profile as the fallback.
 - **Inherit from Default:** unbound controls fall back to the Default profile's binding; "Do nothing" disables a control explicitly.
-- **Hold layers:** hold a trigger key to give the other controls a second set of bindings; a bare tap still runs the trigger's own binding.
+- **Hold layers:** hold a trigger key to give the other controls a second set of bindings; a bare tap still runs the trigger's own binding. Two layer keys chord with each other in either order.
+- **Hold modifier:** a key can act as Shift/⌃/⌥/⌘ (or a mix) for as long as it's held, including on real mouse clicks. Its own hold layer still runs, with the held modifier lifted for those shortcuts.
 - **Per-profile lighting** and per-key colours (the six agent keys on stock hardware).
 
 ### Knob
@@ -25,13 +26,18 @@ Upstream expects its own firmware with an on-device keymap. The stock pad has no
 ### Claude Code status light
 - `agent-hook claude-code` hooks light keys 1–2: blue pulse while working, orange flash when it needs you, green when done, red on error. Multiple sessions take turns. Ambient lighting is left alone.
 
+### Shortcut presets
+- Multi-step presets: open an app, wait, press keys, type text (e.g. Slack search, Outlook calendar/mail, Obsidian command).
+- Added Microsoft Outlook presets.
+
 ### Battery, dimming, power
 - Battery level from `device.status`, polled every 2 minutes, shown in the menu bar ("Connected · battery N%") and Settings.
-- Backlight and ambient dim to 10% after 60 s with no pad input; status keys stay bright; any input restores.
+- Backlight and ambient dim to 10% after a quiet spell (Settings → Standby after, default 1 min, or Never); live status keys stay bright; any input restores.
 - No traffic is sent to the pad while the Mac's display sleeps; the app catches up on wake.
-- Pad power state (idle time, standby, BLE, battery, connect/disconnect) is logged to `~/Library/Logs/OpenMicro/pad-status.log`.
+- Pad power state (idle time, standby, BLE, battery, connect/disconnect) and Bluetooth bond/slot state are logged to `~/Library/Logs/OpenMicro/pad-status.log`.
 
 ### Other
+- Editor: 4×4 board that scales with the window, keys numbered 1–13, stock keycap icons, plain-words summary of what the selected control does; device-mode switcher hidden for the stock pad.
 - Menu bar no longer shows the firmware/serial line.
 - English-only UI (language picker removed).
 - Fix: letter/digit keystroke synthesis no longer crashes on macOS (uses virtual keycodes).
